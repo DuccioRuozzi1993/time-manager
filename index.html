@@ -22,7 +22,7 @@
   <div id="root"></div>
 
 <script type="text/babel">
-const { useState, useMemo, useContext, createContext, useEffect, useRef } = React;
+const { useState, useMemo, useContext, createContext, useEffect, useRef, useCallback } = React;
 
 // ── Storage key ──
 const LS_KEY       = "tm_v1_tasks";
@@ -30,7 +30,24 @@ const LS_THEME     = "tm_v1_theme";
 const LS_TRASH     = "tm_v1_trash";
 const LS_ATT_TRASH = "tm_v1_att_trash";
 const LS_DONE_HIDE = "tm_v1_done_hidden";
-const LS_BUSY      = "tm_v1_busy"; // key: "tm_v1_busy_YYYY-MM-DD"
+const LS_BUSY      = "tm_v1_busy";
+const LS_TEMPLATES   = "tm_v1_templates";
+const LS_LAST_EXPORT = "tm_v1_last_export";
+const LS_EVENT_LOG   = "tm_v1_events";
+const MAX_EVENTS     = 300;
+
+// ── Event log helpers ──
+function readEventLog() {
+  try { const r = localStorage.getItem(LS_EVENT_LOG); return r ? JSON.parse(r) : []; } catch { return []; }
+}
+function writeEventLog(events) {
+  try { localStorage.setItem(LS_EVENT_LOG, JSON.stringify(events.slice(-MAX_EVENTS))); } catch {}
+}
+function appendEvent(type, taskId, meta) {
+  const events = readEventLog();
+  events.push({ type, taskId, date: today, ...(meta || {}) });
+  writeEventLog(events);
+}
 
 // ── IndexedDB — attachment storage ──
 const IDB_NAME  = "tm_files_v1";
@@ -190,6 +207,64 @@ function isEscalated(item) {
   return RANK[computeHz(item)] > RANK[baseHz(item.urgency, item.importance)];
 }
 
+// ── Behavioral suggestions — derived from event log ──
+function computeBehavioralSuggestions(tasks, events) {
+  const out = [];
+  if (!events.length) return out;
+
+  // Count postponements per task
+  const postponeCount = {};
+  events.forEach(e => {
+    if (e.type === "postponed") {
+      postponeCount[e.taskId] = (postponeCount[e.taskId] || 0) + 1;
+    }
+  });
+
+  // Tasks postponed 3+ times that are still active
+  const activeTasks = tasks.filter(t => t.progress < 100);
+  const repeatOffenders = activeTasks.filter(t => (postponeCount[t.id] || 0) >= 3);
+  if (repeatOffenders.length > 0) {
+    const t = repeatOffenders[0];
+    const count = postponeCount[t.id];
+    out.push({
+      id: "repeat_postpone_" + t.id,
+      icon: "warning",
+      text: "\"" + t.title + "\" è stato posticipato " + count + " volte. È ancora rilevante, o puoi eliminarlo?",
+      action: { label: "Elimina", type: "trash", taskId: t.id },
+      action2: { label: "Tienilo", type: "dismiss_postpone", taskId: t.id },
+    });
+  }
+
+  // Tasks created more than 14 days ago still in backlog
+  const createDates = {};
+  events.forEach(e => {
+    if (e.type === "created") createDates[e.taskId] = e.date;
+  });
+
+  const staleBacklog = activeTasks.filter(t => {
+    if (t.type === "inbox" || t.waiting) return false;
+    const hz = computeHz(t);
+    if (hz !== "backlog") return false;
+    const created = createDates[t.id];
+    if (!created) return false;
+    return workDiff(created, today) > 14;
+  });
+
+  if (staleBacklog.length > 0) {
+    const t = staleBacklog[0];
+    const days = createDates[t.id] ? workDiff(createDates[t.id], today) : "?";
+    out.push({
+      id: "stale_backlog_" + t.id,
+      icon: "archive",
+      text: "\"" + t.title + "\" è fermo in backlog da " + days + " giorni lavorativi. Vuoi ancora farlo?",
+      action: { label: "Elimina", type: "trash", taskId: t.id },
+      action2: { label: "Tienilo", type: "dismiss_stale", taskId: t.id },
+    });
+  }
+
+  return out;
+}
+
 function computeSuggestions({ todayItems, inboxItems, projects, backlogItems, waitingItems, load, freeHours }) {
   const out = [];
   const isThursday = new Date().getDay() === 4;
@@ -214,8 +289,48 @@ function computeSuggestions({ todayItems, inboxItems, projects, backlogItems, wa
   return out;
 }
 
+function smartSort(items) {
+  return [...items].sort((a, b) => {
+    // 1. Pinned
+    if (a.pinned && !b.pinned) return -1;
+    if (!a.pinned && b.pinned) return 1;
+    // 2. Scaduto o scade oggi
+    const dA = a.end ? workDiff(today, a.end) : 999;
+    const dB = b.end ? workDiff(today, b.end) : 999;
+    const urgA = dA <= 0 ? 0 : dA <= 3 ? 1 : 2;
+    const urgB = dB <= 0 ? 0 : dB <= 3 ? 1 : 2;
+    if (urgA !== urgB) return urgA - urgB;
+    // 3. Rischio escalation
+    const rA = getRisk(a);
+    const rB = getRisk(b);
+    const rLvl = r => !r ? 2 : r.level === "critical" ? 0 : 1;
+    if (rLvl(rA) !== rLvl(rB)) return rLvl(rA) - rLvl(rB);
+    // 4. Ha una next action definita
+    const nA = a.subtasks.some(s => s.next && !s.done) ? 0 : 1;
+    const nB = b.subtasks.some(s => s.next && !s.done) ? 0 : 1;
+    if (nA !== nB) return nA - nB;
+    // 5. Ha scadenza vs non ha
+    if (dA !== dB) return dA - dB;
+    return 0;
+  });
+}
+
 const calcProg  = subs => subs.length ? Math.round(subs.filter(s => s.done).length / subs.length * 100) : 0;
-const EMPTY_TASK = { title:"", type:"action", color:PALETTE[4], urgency:null, importance:null, start:"", end:"", progress:0, duration:"quick", description:"", subtasks:[], attachments:[], waiting:false, waitingFor:"", waitingSince:"" };
+const EMPTY_TASK = { title:"", type:"action", color:PALETTE[4], urgency:null, importance:null, start:"", end:"", progress:0, duration:"quick", description:"", subtasks:[], attachments:[], waiting:false, waitingFor:"", waitingSince:"", pinned:false, recurrence:null };
+
+// ── Recurrence helper — computes next due date from a completed task ──
+function nextRecurrenceDate(endStr, rec) {
+  if (!endStr || !rec) return null;
+  const d = new Date(endStr + "T12:00:00");
+  if (rec.freq === "daily") {
+    d.setDate(d.getDate() + 1);
+  } else if (rec.freq === "weekly") {
+    d.setDate(d.getDate() + 7);
+  } else if (rec.freq === "monthly") {
+    d.setMonth(d.getMonth() + 1);
+  }
+  return d.toISOString().split("T")[0];
+}
 
 // ── Schema normalizer — merges saved data with current EMPTY_TASK defaults ──
 // Ensures tasks saved by older versions of the app get new fields filled in
@@ -265,13 +380,163 @@ function Icon({ name, size=14, color="currentColor", style={} }) {
   }
 }
 
-function TaskForm({ initial, onSave, onClose, isEdit=false }) {
+// ── Templates Modal ──
+function TemplatesModal({ templates, onClose, onSave }) {
+  const C = useContext(ThemeCtx);
+  const [list, setList] = useState(() => templates.map(t => ({ ...t, subtasks: t.subtasks.map(s => ({ ...s })) })));
+  const [editingId, setEditingId]     = useState(null); // template id being edited
+  const [editingName, setEditingName] = useState("");
+  const [newSubIn, setNewSubIn]       = useState({});   // { [templateId]: string }
+  const [editingSub, setEditingSub]   = useState(null); // { tid, sid, value }
+  const [newTplName, setNewTplName]   = useState("");
+  const [confirm, setConfirm]         = useState(null); // id to delete
+
+  function addTemplate() {
+    const name = newTplName.trim();
+    if (!name) return;
+    setList(l => [...l, { id: Date.now(), name, subtasks: [] }]);
+    setNewTplName("");
+  }
+
+  function deleteTemplate(id) { setList(l => l.filter(t => t.id !== id)); setConfirm(null); }
+
+  function startRename(t) { setEditingId(t.id); setEditingName(t.name); }
+  function commitRename(id) {
+    const n = editingName.trim();
+    if (n) setList(l => l.map(t => t.id === id ? { ...t, name: n } : t));
+    setEditingId(null);
+  }
+
+  function addSub(tid) {
+    const label = (newSubIn[tid] || "").trim();
+    if (!label) return;
+    setList(l => l.map(t => t.id === tid ? { ...t, subtasks: [...t.subtasks, { id: Date.now(), label }] } : t));
+    setNewSubIn(s => ({ ...s, [tid]: "" }));
+  }
+  function delSub(tid, sid) {
+    setList(l => l.map(t => t.id === tid ? { ...t, subtasks: t.subtasks.filter(s => s.id !== sid) } : t));
+  }
+  function commitSubRename(tid, sid) {
+    const v = (editingSub && editingSub.value || "").trim();
+    if (v) setList(l => l.map(t => t.id === tid ? { ...t, subtasks: t.subtasks.map(s => s.id === sid ? { ...s, label: v } : s) } : t));
+    setEditingSub(null);
+  }
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px", width:520, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, flexShrink:0 }}>
+          <div>
+            <div style={{ fontSize:17, fontWeight:700, color:C.l1 }}>Modelli di sottotask</div>
+            <div style={{ fontSize:12, color:C.l3, marginTop:2 }}>Schemi riutilizzabili da applicare ai task</div>
+          </div>
+          <button onClick={() => { onSave(list); onClose(); }} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"8px 18px", fontWeight:600, fontSize:13, cursor:"pointer", fontFamily:"inherit" }}>Salva</button>
+        </div>
+
+        {/* New template input */}
+        <div style={{ display:"flex", gap:8, marginBottom:18, flexShrink:0 }}>
+          <input style={inp(C, { flex:1 })} value={newTplName} placeholder="Nome nuovo modello…"
+            onChange={e => setNewTplName(e.target.value)}
+            onKeyDown={e => e.key === "Enter" && addTemplate()} />
+          <button onClick={addTemplate}
+            style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, width:42, cursor:"pointer", fontSize:20, fontWeight:300, flexShrink:0 }}>+</button>
+        </div>
+
+        {/* List */}
+        <div style={{ overflowY:"auto", flex:1, display:"flex", flexDirection:"column", gap:12 }}>
+          {list.length === 0 && (
+            <div style={{ textAlign:"center", padding:"40px 0", color:C.l3, fontSize:13 }}>Nessun modello ancora. Creane uno qui sopra.</div>
+          )}
+          {list.map(tpl => (
+            <div key={tpl.id} style={{ background:C.s2, borderRadius:14, padding:"14px 16px" }}>
+
+              {/* Template name row */}
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+                {editingId === tpl.id ? (
+                  <input autoFocus value={editingName} onChange={e => setEditingName(e.target.value)}
+                    onKeyDown={e => { if (e.key === "Enter") commitRename(tpl.id); if (e.key === "Escape") setEditingId(null); }}
+                    onBlur={() => commitRename(tpl.id)}
+                    style={{ flex:1, background:"none", border:"none", borderBottom:`1.5px solid ${C.blue}`, outline:"none", fontSize:14, fontWeight:700, color:C.l1, padding:"1px 2px", fontFamily:"inherit" }} />
+                ) : (
+                  <span onClick={() => startRename(tpl)} title="Clicca per rinominare"
+                    style={{ flex:1, fontSize:14, fontWeight:700, color:C.l1, cursor:"text" }}>{tpl.name}</span>
+                )}
+                <button onClick={() => setConfirm(tpl.id)}
+                  style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:12, opacity:0.5, fontFamily:"inherit", padding:"2px 6px" }}
+                  onMouseEnter={e => e.currentTarget.style.opacity="1"}
+                  onMouseLeave={e => e.currentTarget.style.opacity="0.5"}>Elimina</button>
+              </div>
+
+              {/* Subtasks */}
+              {tpl.subtasks.length > 0 && (
+                <div style={{ background:C.s1, borderRadius:10, overflow:"hidden", marginBottom:8 }}>
+                  {tpl.subtasks.map((s, idx) => (
+                    <div key={s.id} style={{ display:"flex", alignItems:"center", gap:8, padding:"8px 12px", borderBottom: idx < tpl.subtasks.length-1 ? `1px solid ${C.sep}` : "none" }}>
+                      <div style={{ width:5, height:5, borderRadius:"50%", background:C.l3, flexShrink:0 }} />
+                      {editingSub && editingSub.tid === tpl.id && editingSub.sid === s.id ? (
+                        <input autoFocus value={editingSub.value}
+                          onChange={e => setEditingSub(es => ({ ...es, value: e.target.value }))}
+                          onKeyDown={e => { if (e.key === "Enter") commitSubRename(tpl.id, s.id); if (e.key === "Escape") setEditingSub(null); }}
+                          onBlur={() => commitSubRename(tpl.id, s.id)}
+                          style={{ flex:1, background:"none", border:"none", borderBottom:`1.5px solid ${C.blue}`, outline:"none", fontSize:13, color:C.l1, padding:"1px 2px", fontFamily:"inherit" }} />
+                      ) : (
+                        <span onClick={() => setEditingSub({ tid:tpl.id, sid:s.id, value:s.label })}
+                          title="Clicca per modificare"
+                          style={{ flex:1, fontSize:13, color:C.l1, cursor:"text" }}>{s.label}</span>
+                      )}
+                      <button onClick={() => delSub(tpl.id, s.id)}
+                        style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:16, opacity:0.4, padding:0, lineHeight:1 }}
+                        onMouseEnter={e => e.currentTarget.style.opacity="1"}
+                        onMouseLeave={e => e.currentTarget.style.opacity="0.4"}>−</button>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {/* Add subtask to template */}
+              <div style={{ display:"flex", gap:6 }}>
+                <input style={inp(C, { flex:1, fontSize:12, padding:"7px 10px" })}
+                  value={newSubIn[tpl.id] || ""}
+                  placeholder="Aggiungi voce al modello…"
+                  onChange={e => setNewSubIn(s => ({ ...s, [tpl.id]: e.target.value }))}
+                  onKeyDown={e => e.key === "Enter" && addSub(tpl.id)} />
+                <button onClick={() => addSub(tpl.id)}
+                  style={{ background:C.s3, border:"none", color:C.blue, borderRadius:8, width:32, cursor:"pointer", fontSize:18, flexShrink:0 }}>+</button>
+              </div>
+
+            </div>
+          ))}
+        </div>
+
+        {/* Confirm delete */}
+        {confirm && (
+          <div style={{ marginTop:14, background:`${C.red}12`, borderRadius:12, padding:"12px 14px", display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexShrink:0 }}>
+            <span style={{ fontSize:13, color:C.l2 }}>Eliminare questo modello?</span>
+            <div style={{ display:"flex", gap:8 }}>
+              <button onClick={() => setConfirm(null)} style={{ fontSize:12, color:C.l3, background:C.s3, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontFamily:"inherit" }}>Annulla</button>
+              <button onClick={() => deleteTemplate(confirm)} style={{ fontSize:12, color:"#fff", background:C.red, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>Elimina</button>
+            </div>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSaveTemplate }) {
   const C   = useContext(ThemeCtx);
   const lbl = slbl(C);
   const [form, setForm] = useState(initial);
   const [subIn, setSubIn] = useState("");
+  const [editingSub, setEditingSub] = useState(null);
+  const [showTplPicker, setShowTplPicker] = useState(false);
+  const [saveTplName, setSaveTplName]     = useState("");
+  const [showSaveTpl, setShowSaveTpl]     = useState(false);
   const set = (k,v) => setForm(f => ({ ...f, [k]:v }));
-  const ok  = form.title.trim() && (form.type === "inbox" || form.type === "action" || form.end);
+  const ok  = form.title.trim() && (form.type === "inbox" || form.urgency !== null);
 
   const handleSave = () => {
     if (!ok) return;
@@ -362,52 +627,53 @@ function TaskForm({ initial, onSave, onClose, isEdit=false }) {
 
       {form.type !== "inbox" && (
         <>
-          {/* Type */}
+          {/* Duration */}
           <div style={{ marginBottom:14 }}>
-            <span style={lbl}>Tipo</span>
-            <div style={{ display:"flex", gap:6 }}>
-              {[["action","bolt","Azione","Una sessione"],["project","layers","Progetto","Più sessioni"]].map(function(arr) {
-                var t=arr[0], ic=arr[1], l=arr[2], d=arr[3];
-                return (
-                  <div key={t} onClick={() => set("type", t)} style={{ flex:1, padding:"10px 12px", borderRadius:12, background:form.type === t ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.type === t ? C.blue : "transparent"), cursor:"pointer", transition:"all 0.15s" }}>
-                    <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:2, color:form.type === t ? C.blue : C.l1 }}>
-                      <Icon name={ic} size={13} color="currentColor"/>
-                      <span style={{ fontSize:13, fontWeight:600 }}>{l}</span>
-                    </div>
-                    <div style={{ fontSize:11, color:C.l3 }}>{d}</div>
-                  </div>
-                );
-              })}
+            <span style={lbl}>Impegno stimato</span>
+            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+              {DURATIONS.filter(function(d){ return ACTION_DURATIONS.indexOf(d.id) >= 0; }).map(d => (
+                <div key={d.id} onClick={() => set("duration", d.id)} style={{ flex:1, padding:"9px 10px", borderRadius:10, background:form.duration === d.id ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.duration === d.id ? C.blue : "transparent"), cursor:"pointer", textAlign:"center", transition:"all 0.15s" }}>
+                  <div style={{ display:"flex", justifyContent:"center", marginBottom:4, color:form.duration === d.id ? C.blue : C.l3 }}><Icon name={d.icon} size={14} color="currentColor" /></div>
+                  <div style={{ fontSize:11, fontWeight:600, color:form.duration === d.id ? C.blue : C.l1 }}>{d.label}</div>
+                </div>
+              ))}
             </div>
           </div>
 
-          {/* Duration */}
-          {form.type === "action" && (
-            <div style={{ marginBottom:14 }}>
-              <span style={lbl}>Impegno stimato</span>
-              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                {DURATIONS.filter(function(d){ return ACTION_DURATIONS.indexOf(d.id) >= 0; }).map(d => (
-                  <div key={d.id} onClick={() => set("duration", d.id)} style={{ flex:1, padding:"9px 10px", borderRadius:10, background:form.duration === d.id ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.duration === d.id ? C.blue : "transparent"), cursor:"pointer", textAlign:"center", transition:"all 0.15s" }}>
-                    <div style={{ display:"flex", justifyContent:"center", marginBottom:4, color:form.duration === d.id ? C.blue : C.l3 }}><Icon name={d.icon} size={14} color="currentColor" /></div>
-                    <div style={{ fontSize:11, fontWeight:600, color:form.duration === d.id ? C.blue : C.l1 }}>{d.label}</div>
-                  </div>
+          {/* Dates */}
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+            <div><span style={lbl}>Inizio <span style={{ color:C.l3, fontWeight:400 }}>(opz.)</span></span><input type="date" style={inp(C)} value={form.start} onChange={e => set("start", e.target.value)} /></div>
+            <div><span style={lbl}>Scadenza <span style={{ color:C.l3, fontWeight:400 }}>(opz.)</span></span><input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} /></div>
+          </div>
+
+          {/* Recurrence */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: form.recurrence ? 8 : 0 }}>
+              <span style={{ ...lbl, marginBottom:0 }}>Ricorrenza</span>
+              <button onClick={() => set("recurrence", form.recurrence ? null : { freq:"weekly" })}
+                style={{ fontSize:11, color: form.recurrence ? C.blue : C.l3, background: form.recurrence ? `${C.blue}18` : "none", border:`1px solid ${form.recurrence ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                {form.recurrence ? "✓ Attiva" : "Attiva"}
+              </button>
+            </div>
+            {form.recurrence && (
+              <div style={{ display:"flex", gap:6 }}>
+                {[
+                  { id:"daily",   label:"Ogni giorno" },
+                  { id:"weekly",  label:"Ogni settimana" },
+                  { id:"monthly", label:"Ogni mese" },
+                ].map(opt => (
+                  <button key={opt.id}
+                    onClick={() => set("recurrence", { freq:opt.id })}
+                    style={{ flex:1, padding:"8px 6px", borderRadius:10, background: form.recurrence.freq === opt.id ? `${C.blue}20` : C.s2, border:`1.5px solid ${form.recurrence.freq === opt.id ? C.blue : "transparent"}`, cursor:"pointer", fontSize:12, fontWeight:600, color: form.recurrence.freq === opt.id ? C.blue : C.l1, fontFamily:"inherit", transition:"all 0.15s" }}>
+                    {opt.label}
+                  </button>
                 ))}
               </div>
-            </div>
-          )}
-
-          {/* Dates */}
-          {form.type === "action" ? (
-            <div style={{ marginBottom:14 }}>
-              <span style={lbl}>Scadenza <span style={{ color:C.l3, fontWeight:400 }}>(opzionale — alimenta l'urgenza automatica)</span></span>
-              <input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} />
-            </div>
-          ) : (
-            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
-              <div><span style={lbl}>Inizio</span><input type="date" style={inp(C)} value={form.start} onChange={e => set("start", e.target.value)} /></div>
-              <div><span style={lbl}>Scadenza</span><input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} /></div>
-            </div>
-          )}
+            )}
+            {form.recurrence && !form.end && (
+              <div style={{ fontSize:11, color:C.orange, marginTop:6 }}>⚠ Imposta una scadenza per attivare la ricorrenza.</div>
+            )}
+          </div>
 
           {/* Color */}
           <div style={{ marginBottom:14 }}>
@@ -423,28 +689,116 @@ function TaskForm({ initial, onSave, onClose, isEdit=false }) {
             </div>
           </div>
 
-          {/* Subtasks (projects only) */}
-          {form.type === "project" && (
-            <div style={{ marginBottom:14 }}>
-              <span style={lbl}>Sotto-attività ({form.subtasks.length})</span>
-              <div style={{ display:"flex", gap:8, marginBottom:8 }}>
-                <input style={inp(C,{ flex:1 })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSubField()} />
-                <button onClick={addSubField} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, width:42, cursor:"pointer", fontSize:20, fontWeight:300, flexShrink:0 }}>+</button>
+          {/* Subtasks */}
+          <div style={{ marginBottom:14 }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+              <span style={lbl}>Sotto-attività {form.subtasks.length > 0 && <span style={{ color:C.l3, fontWeight:400 }}>({form.subtasks.length})</span>}</span>
+              <div style={{ display:"flex", gap:6 }}>
+                {templates.length > 0 && (
+                  <button onClick={() => setShowTplPicker(p => !p)}
+                    style={{ fontSize:11, color: showTplPicker ? C.blue : C.l3, background: showTplPicker ? `${C.blue}18` : "none", border:`1px solid ${showTplPicker ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                    Da modello ↓
+                  </button>
+                )}
+                {form.subtasks.length > 0 && onSaveTemplate && (
+                  <button onClick={() => setShowSaveTpl(p => !p)}
+                    style={{ fontSize:11, color: showSaveTpl ? C.blue : C.l3, background: showSaveTpl ? `${C.blue}18` : "none", border:`1px solid ${showSaveTpl ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                    Salva modello
+                  </button>
+                )}
               </div>
-              {form.subtasks.length > 0 && (
-                <div style={{ background:C.s2, borderRadius:12, overflow:"hidden" }}>
-                  {form.subtasks.map(function(s, idx) {
-                    return (
-                      <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"10px 14px", borderBottom:idx < form.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:10 }}>
-                        <span style={{ flex:1, fontSize:14, color:C.l1 }}>{s.label}</span>
-                        <button onClick={() => set("subtasks", form.subtasks.filter(function(x){ return x.id !== s.id; }))} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, opacity:0.7, padding:0 }}>−</button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
             </div>
-          )}
+
+            {/* Template picker */}
+            {showTplPicker && (
+              <div style={{ background:C.s2, borderRadius:12, padding:"10px", marginBottom:8, display:"flex", flexDirection:"column", gap:5 }}>
+                <div style={{ fontSize:11, color:C.l3, marginBottom:4, paddingLeft:2 }}>Seleziona un modello da applicare — i sottotask verranno aggiunti a quelli esistenti</div>
+                {templates.map(tpl => (
+                  <button key={tpl.id}
+                    onClick={() => {
+                      const newSubs = tpl.subtasks.map(s => ({ ...s, id: Date.now() + Math.random(), done: false }));
+                      set("subtasks", [...form.subtasks, ...newSubs]);
+                      setShowTplPicker(false);
+                    }}
+                    style={{ background:C.s1, border:`1px solid ${C.sep}`, borderRadius:9, padding:"9px 12px", cursor:"pointer", textAlign:"left", fontFamily:"inherit", transition:"all 0.12s" }}
+                    onMouseEnter={e => { e.currentTarget.style.borderColor = C.blue+"60"; e.currentTarget.style.background = C.s3; }}
+                    onMouseLeave={e => { e.currentTarget.style.borderColor = C.sep; e.currentTarget.style.background = C.s1; }}>
+                    <div style={{ fontSize:13, fontWeight:600, color:C.l1, marginBottom:2 }}>{tpl.name}</div>
+                    <div style={{ fontSize:11, color:C.l3 }}>{tpl.subtasks.length} voc{tpl.subtasks.length === 1 ? "e" : "i"}: {tpl.subtasks.slice(0,3).map(s => s.label).join(" · ")}{tpl.subtasks.length > 3 ? " …" : ""}</div>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {/* Save as template */}
+            {showSaveTpl && (
+              <div style={{ background:`${C.blue}10`, border:`1px solid ${C.blue}30`, borderRadius:12, padding:"10px 12px", marginBottom:8, display:"flex", gap:8, alignItems:"center" }}>
+                <input style={inp(C, { flex:1, fontSize:12, padding:"7px 10px" })}
+                  value={saveTplName} placeholder="Nome del modello…"
+                  autoFocus
+                  onChange={e => setSaveTplName(e.target.value)}
+                  onKeyDown={e => {
+                    if (e.key === "Enter") {
+                      const n = saveTplName.trim();
+                      if (n) { onSaveTemplate({ id:Date.now(), name:n, subtasks: form.subtasks.map(s => ({ id:Date.now()+Math.random(), label:s.label })) }); setSaveTplName(""); setShowSaveTpl(false); }
+                    }
+                    if (e.key === "Escape") setShowSaveTpl(false);
+                  }} />
+                <button
+                  onClick={() => {
+                    const n = saveTplName.trim();
+                    if (n) { onSaveTemplate({ id:Date.now(), name:n, subtasks: form.subtasks.map(s => ({ id:Date.now()+Math.random(), label:s.label })) }); setSaveTplName(""); setShowSaveTpl(false); }
+                  }}
+                  style={{ background:C.blue, border:"none", color:"#fff", borderRadius:8, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:600, fontFamily:"inherit", flexShrink:0 }}>
+                  Salva
+                </button>
+              </div>
+            )}
+
+            <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+              <input style={inp(C,{ flex:1 })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSubField()} />
+              <button onClick={addSubField} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, width:42, cursor:"pointer", fontSize:20, fontWeight:300, flexShrink:0 }}>+</button>
+            </div>
+            {form.subtasks.length > 0 && (
+              <div style={{ background:C.s2, borderRadius:12, overflow:"hidden" }}>
+                {form.subtasks.map(function(s, idx) {
+                  return (
+                    <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"10px 14px", borderBottom:idx < form.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:10 }}>
+                      {editingSub && editingSub.id === s.id ? (
+                        <input
+                          autoFocus
+                          value={editingSub.value}
+                          onChange={e => setEditingSub(es => ({ ...es, value: e.target.value }))}
+                          onKeyDown={e => {
+                            if (e.key === "Enter") {
+                              const v = editingSub.value.trim();
+                              if (v) set("subtasks", form.subtasks.map(x => x.id === s.id ? { ...x, label: v } : x));
+                              setEditingSub(null);
+                            }
+                            if (e.key === "Escape") setEditingSub(null);
+                          }}
+                          onBlur={() => {
+                            const v = editingSub.value.trim();
+                            if (v) set("subtasks", form.subtasks.map(x => x.id === s.id ? { ...x, label: v } : x));
+                            setEditingSub(null);
+                          }}
+                          style={{ flex:1, background:"none", border:"none", borderBottom:`1.5px solid ${C.blue}`, outline:"none", fontSize:14, color:C.l1, padding:"1px 2px", fontFamily:"inherit" }}
+                        />
+                      ) : (
+                        <span
+                          onClick={() => setEditingSub({ id: s.id, value: s.label })}
+                          title="Clicca per modificare"
+                          style={{ flex:1, fontSize:14, color:C.l1, cursor:"text" }}>
+                          {s.label}
+                        </span>
+                      )}
+                      <button onClick={() => set("subtasks", form.subtasks.filter(function(x){ return x.id !== s.id; }))} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, opacity:0.7, padding:0 }}>−</button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           {/* Notes */}
           <div style={{ marginBottom:14 }}>
@@ -483,30 +837,57 @@ function TaskForm({ initial, onSave, onClose, isEdit=false }) {
   );
 }
 
-function SuggestionWhisper({ suggestions }) {
+function SuggestionWhisper({ suggestions, onAction }) {
   const C = useContext(ThemeCtx);
   const [idx, setIdx] = useState(0);
   const [dismissed, setDismissed] = useState(() => {
     try { return localStorage.getItem("tm_v1_whisper_dismissed") === today; } catch { return false; }
   });
+  const [localDismissed, setLocalDismissed] = useState([]);
 
   function dismiss() {
     try { localStorage.setItem("tm_v1_whisper_dismissed", today); } catch {}
     setDismissed(true);
   }
 
-  if (!suggestions.length || dismissed) return null;
-  const s = suggestions[Math.min(idx, suggestions.length-1)];
+  const visible = suggestions.filter(s => !localDismissed.includes(s.id));
+  if (!visible.length || dismissed) return null;
+  const s = visible[Math.min(idx, visible.length - 1)];
+
+  function handleAction(act) {
+    if (onAction) onAction(act);
+    setLocalDismissed(d => [...d, s.id]);
+    setIdx(0);
+  }
+
   return (
-    <div style={{ background:C.s1, borderRadius:12, padding:"11px 14px", marginBottom:16, display:"flex", alignItems:"center", gap:12, border:`1px solid ${C.sep}` }}>
-      <span style={{ display:"flex", alignItems:"center", flexShrink:0, color: s.icon === "warning" ? C.orange : C.l3 }}><Icon name={s.icon} size={14} color="currentColor"/></span>
-      <span style={{ flex:1, fontSize:13, color:C.l2, lineHeight:1.45 }}>{s.text}</span>
+    <div style={{ background:C.s1, borderRadius:12, padding:"11px 14px", marginBottom:16, display:"flex", alignItems:"flex-start", gap:12, border:`1px solid ${C.sep}` }}>
+      <span style={{ display:"flex", alignItems:"center", flexShrink:0, color: s.icon === "warning" ? C.orange : C.l3, marginTop:1 }}><Icon name={s.icon} size={14} color="currentColor"/></span>
+      <div style={{ flex:1, minWidth:0 }}>
+        <span style={{ fontSize:13, color:C.l2, lineHeight:1.45 }}>{s.text}</span>
+        {(s.action || s.action2) && (
+          <div style={{ display:"flex", gap:6, marginTop:8 }}>
+            {s.action && (
+              <button onClick={() => handleAction(s.action)}
+                style={{ fontSize:11, fontWeight:600, color:C.red, background:C.red+"15", border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+                {s.action.label}
+              </button>
+            )}
+            {s.action2 && (
+              <button onClick={() => handleAction(s.action2)}
+                style={{ fontSize:11, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+                {s.action2.label}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
       <div style={{ display:"flex", gap:4, alignItems:"center", flexShrink:0 }}>
-        {suggestions.length > 1 && (
+        {visible.length > 1 && (
           <>
-            <button onClick={() => setIdx(i => (i-1+suggestions.length)%suggestions.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>‹</button>
-            <span style={{ fontSize:11, color:C.l3 }}>{idx+1}/{suggestions.length}</span>
-            <button onClick={() => setIdx(i => (i+1)%suggestions.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>›</button>
+            <button onClick={() => setIdx(i => (i-1+visible.length)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>‹</button>
+            <span style={{ fontSize:11, color:C.l3 }}>{Math.min(idx,visible.length-1)+1}/{visible.length}</span>
+            <button onClick={() => setIdx(i => (i+1)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>›</button>
           </>
         )}
         <button onClick={dismiss} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:14, padding:"2px 8px", marginLeft:4 }}>✕</button>
@@ -556,7 +937,7 @@ function QuickCapture({ onAdd }) {
   );
 }
 
-function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor }) {
+function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePin }) {
   const C       = useContext(ThemeCtx);
   const dL      = task.end ? workDiff(today, task.end) : null;
   const doneSubs = task.subtasks.filter(s => s.done).length;
@@ -589,6 +970,14 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor }) {
           <div style={{ flex:1, minWidth:0 }}>
             <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom: task.description ? 2 : 3, flexWrap:"wrap" }}>
               <span style={{ fontSize:15, fontWeight:600, color:isInbox ? C.l2 : task.waiting ? C.l2 : C.l1 }}>{task.title}</span>
+              {task.recurrence && (
+                <span title={`Ricorrente · ${task.recurrence.freq === "daily" ? "ogni giorno" : task.recurrence.freq === "weekly" ? "ogni settimana" : "ogni mese"}`} style={{ display:"inline-flex", alignItems:"center", color:C.l3, opacity:0.6 }}>
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+                    <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+                  </svg>
+                </span>
+              )}
               {isInbox && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>}
               {task.waiting && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.teal}22`, color:C.teal, display:"inline-flex", alignItems:"center", gap:3 }}><Icon name="pause" size={9} color="currentColor"/>in attesa</span>}
               {escalated && !isInbox && !task.waiting && (
@@ -616,13 +1005,25 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor }) {
               {risk && !isInbox && <span style={{ fontSize:11, color:risk.color }}>{risk.tip}</span>}
             </div>
           </div>
+          {/* Pin button */}
+          {!isInbox && (
+            <div onClick={e => { e.stopPropagation(); onTogglePin && onTogglePin(task.id); }}
+              title={task.pinned ? "Rimuovi pin" : "Fissa in cima"}
+              className="pin-btn"
+              style={{ flexShrink:0, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity: task.pinned ? 1 : 0, transition:"opacity 0.15s", color: task.pinned ? C.blue : C.l3 }}>
+              <svg width="11" height="13" viewBox="0 0 16 20" fill={task.pinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M9 1H7a1 1 0 0 0-1 1v1H4a1 1 0 0 0-.894 1.447L5 8v3a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V8l1.894-3.553A1 1 0 0 0 12 3h-2V2a1 1 0 0 0-1-1z"/>
+                <line x1="8" y1="12" x2="8" y2="19"/>
+              </svg>
+            </div>
+          )}
           <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3, flexShrink:0 }}>
-            {!isInbox && <span style={{ fontSize:13, fontWeight:600, color:task.color }}>{task.progress}%</span>}
+            {!isInbox && task.subtasks.length > 0 && <span style={{ fontSize:13, fontWeight:600, color:task.color }}>{task.progress}%</span>}
             {dL !== null && <span style={{ fontSize:11, color:dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
               {dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : dL === 1 ? "Dom." : `${dL}gg lav.`}
             </span>}
           </div>
-          {!isInbox && (
+          {!isInbox && task.subtasks.length > 0 && (
             <div style={{ width:3, height:34, background:C.s3, borderRadius:3, overflow:"hidden", flexShrink:0 }}>
               <div style={{ width:"100%", height:`${task.progress}%`, background:task.color, borderRadius:3, transition:"height 0.3s", marginTop:`${100-task.progress}%` }} />
             </div>
@@ -641,7 +1042,7 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor }) {
   );
 }
 
-function AgendaSection({ items, selected, onSelect, onComplete, label, color, extra }) {
+function AgendaSection({ items, selected, onSelect, onComplete, label, color, extra, onTogglePin }) {
   const C = useContext(ThemeCtx);
   const [collapsed, setCollapsed] = useState(false);
   if (!items.length) return null;
@@ -660,7 +1061,7 @@ function AgendaSection({ items, selected, onSelect, onComplete, label, color, ex
         <div style={card(C)}>
           {items.map((task, idx) => (
             <div key={task.id} style={{ borderBottom:idx < items.length-1 ? `1px solid ${C.sep}` : "none" }}>
-              <AgendaRow task={task} isSelected={selected === task.id} onSelect={() => onSelect(task.id)} onComplete={onComplete} hzColor={color} />
+              <AgendaRow task={task} isSelected={selected === task.id} onSelect={() => onSelect(task.id)} onComplete={onComplete} hzColor={color} onTogglePin={onTogglePin} />
             </div>
           ))}
         </div>
@@ -787,10 +1188,11 @@ function AttachmentSection({ task, onAdd, onRemove }) {
   );
 }
 
-function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete, onToggleSub, onAddSub, onDelSub, onSetNext, onUpdateProg, onToggleWaiting, onAddAttachment, onRemoveAttachment }) {
+function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete, onToggleSub, onAddSub, onDelSub, onSetNext, onRenameSub, onUpdateProg, onToggleWaiting, onAddAttachment, onRemoveAttachment }) {
   const C      = useContext(ThemeCtx);
   const lbl    = slbl(C);
   const [subIn, setSubIn] = useState("");
+  const [editingSub, setEditingSub] = useState(null); // { id, value }
   const dL     = task.end ? workDiff(today, task.end) : null;
   const doneSubs = task.subtasks.filter(s => s.done).length;
   const riskRaw = getRisk(task);
@@ -845,6 +1247,21 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
         </div>
       )}
 
+      {task.recurrence && (
+        <div style={{ background:`${C.blue}10`, borderRadius:12, padding:"10px 14px", marginBottom:12, border:`1px solid ${C.blue}28`, display:"flex", alignItems:"center", gap:8 }}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink:0 }}>
+            <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
+            <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+          </svg>
+          <span style={{ fontSize:12, color:C.blue, fontWeight:600 }}>
+            Ricorrente · {task.recurrence.freq === "daily" ? "ogni giorno" : task.recurrence.freq === "weekly" ? "ogni settimana" : "ogni mese"}
+          </span>
+          <span style={{ fontSize:11, color:C.l3, marginLeft:"auto" }}>
+            {task.end ? `Prossima: ${nextRecurrenceDate(task.end, task.recurrence)}` : "Imposta scadenza"}
+          </span>
+        </div>
+      )}
+
       <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
         {HZ[compHz] && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:hzColor(compHz,C)+"2A", color:hzColor(compHz,C) }}>{HZ[compHz].label}</span>}
         {cell && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:cell.color+"2A", color:cell.color }}>{cell.label}</span>}
@@ -878,29 +1295,18 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
         </div>
       )}
 
-      <div style={{ marginBottom:12 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-          <span style={{ fontSize:12, color:C.l2, fontWeight:500 }}>Avanzamento</span>
-          <span style={{ fontSize:12, fontWeight:600, color:task.color }}>{task.progress}%</span>
-        </div>
-        {task.subtasks.length === 0 ? (
-          <div style={{ position:"relative", height:10, borderRadius:5, background:C.s3, overflow:"hidden", cursor:"pointer" }}
-            onClick={e => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const pct  = Math.round((e.clientX - rect.left) / rect.width * 100);
-              onUpdateProg(task.id, Math.min(100, Math.max(0, pct)));
-            }}>
-            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.15s" }} />
+      {task.subtasks.length > 0 && (
+        <div style={{ marginBottom:12 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+            <span style={{ fontSize:12, color:C.l2, fontWeight:500 }}>Avanzamento</span>
+            <span style={{ fontSize:12, fontWeight:600, color:task.color }}>{task.progress}%</span>
           </div>
-        ) : (
-          <>
-            <div style={{ background:C.s3, borderRadius:5, height:6, overflow:"hidden" }}>
-              <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
-            </div>
-            <div style={{ fontSize:11, color:C.l3, textAlign:"center", marginTop:4 }}>Calcolato dai sottotask</div>
-          </>
-        )}
-      </div>
+          <div style={{ background:C.s3, borderRadius:5, height:6, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
+          </div>
+          <div style={{ fontSize:11, color:C.l3, textAlign:"center", marginTop:4 }}>Calcolato dai sottotask</div>
+        </div>
+      )}
 
       <div style={{ marginBottom:12 }}>
         <div style={{ display:"flex", justifyContent:"space-between", marginBottom:7 }}>
@@ -915,26 +1321,51 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
                   style={{ width:15, height:15, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", transition:"all 0.2s" }}>
                   {s.done && <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>}
                 </div>
-                <span onClick={() => onToggleSub(task.id, s.id)} style={{ flex:1, fontSize:13, color:s.done ? C.l3 : C.l1, textDecoration:s.done ? "line-through" : "none", cursor:"pointer" }}>{s.label}</span>
+                {editingSub && editingSub.id === s.id ? (
+                  <input
+                    autoFocus
+                    value={editingSub.value}
+                    onChange={e => setEditingSub(es => ({ ...es, value: e.target.value }))}
+                    onKeyDown={e => {
+                      if (e.key === "Enter") {
+                        const v = editingSub.value.trim();
+                        if (v) onRenameSub(task.id, s.id, v);
+                        setEditingSub(null);
+                      }
+                      if (e.key === "Escape") setEditingSub(null);
+                    }}
+                    onBlur={() => {
+                      const v = editingSub.value.trim();
+                      if (v) onRenameSub(task.id, s.id, v);
+                      setEditingSub(null);
+                    }}
+                    style={{ flex:1, background:"none", border:"none", borderBottom:`1.5px solid ${C.blue}`, outline:"none", fontSize:13, color:C.l1, padding:"1px 2px", fontFamily:"inherit" }}
+                  />
+                ) : (
+                  <span
+                    onClick={e => { e.stopPropagation(); if (!s.done) setEditingSub({ id: s.id, value: s.label }); }}
+                    title={s.done ? "" : "Clicca per modificare"}
+                    style={{ flex:1, fontSize:13, color:s.done ? C.l3 : C.l1, textDecoration:s.done ? "line-through" : "none", cursor: s.done ? "default" : "text" }}>
+                    {s.label}
+                  </span>
+                )}
                 {!s.done && (
                   <button onClick={() => onSetNext(task.id, s.id)}
                     style={{ background:s.next ? task.color+"22" : "none", border:`1px solid ${s.next ? task.color : C.s3}`, color:s.next ? task.color : C.l3, borderRadius:5, padding:"1px 6px", cursor:"pointer", fontSize:9, fontWeight:700, flexShrink:0 }}>
                     {s.next ? "→ next" : "→"}
                   </button>
                 )}
-                {task.type === "project" && (
-                  <button onClick={() => onDelSub(task.id, s.id)}
-                    style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:15, padding:0, opacity:0, transition:"opacity 0.15s" }}
-                    onMouseEnter={e => e.currentTarget.style.opacity = "0.7"}
-                    onMouseLeave={e => e.currentTarget.style.opacity = "0"}>−</button>
-                )}
+                <button onClick={() => onDelSub(task.id, s.id)}
+                  style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:15, padding:0, opacity:0, transition:"opacity 0.15s" }}
+                  onMouseEnter={e => e.currentTarget.style.opacity = "0.7"}
+                  onMouseLeave={e => e.currentTarget.style.opacity = "0"}>−</button>
               </div>
             ))}
           </div>
         )}
-        {task.type === "project" && (
+        {task.type !== "inbox" && (
           <div style={{ display:"flex", gap:6 }}>
-            <input style={inp(C,{ flex:1, fontSize:13, padding:"8px 11px" })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSub()} />
+            <input style={inp(C,{ flex:1, fontSize:13, padding:"8px 11px" })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSubPanel()} />
             <button onClick={addSubPanel} style={{ background:C.s2, border:"none", color:C.blue, borderRadius:9, width:34, cursor:"pointer", fontSize:18, flexShrink:0 }}>+</button>
           </div>
         )}
@@ -1256,7 +1687,7 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
                         <div style={{ flex:1, minWidth:0 }}>
                           <div style={{ fontSize:13, fontWeight:600, color:C.l2, marginBottom:1 }}>{t.title}</div>
                           <div style={{ fontSize:11, color:C.l3 }}>
-                            {t.type === "inbox" ? "Inbox" : t.type === "project" ? "Progetto" : "Azione"}
+                            {t.type === "inbox" ? "Inbox" : t.subtasks && t.subtasks.length > 0 ? "Progetto" : "Azione"}
                             {t.deletedAt && <span> · {fmtDeleted(t.deletedAt)}</span>}
                           </div>
                         </div>
@@ -1397,7 +1828,7 @@ function GanttView({ tasks, onSelect }) {
   // split projects
   const planned = [], unplanned = [];
   tasks.forEach(function(t) {
-    if (t.type !== "project" || t.progress === 100) return;
+    if (t.progress === 100) return;
     let s = parseDate(t.start), e = parseDate(t.end);
     if (s && e && e >= s) planned.push(t);
     else unplanned.push(t);
@@ -1597,6 +2028,156 @@ function GanttView({ tasks, onSelect }) {
 }
 
 // ── Saved indicator ──
+// ── Storage usage ──
+function getStorageUsage() {
+  try {
+    const keys = [LS_KEY, LS_TRASH, LS_ATT_TRASH, LS_TEMPLATES, LS_EVENT_LOG];
+    let total = 0;
+    const breakdown = {};
+    keys.forEach(k => {
+      const v = localStorage.getItem(k) || "";
+      const bytes = new Blob([v]).size;
+      breakdown[k] = bytes;
+      total += bytes;
+    });
+    // localStorage limit is typically 5MB per origin
+    const LIMIT = 5 * 1024 * 1024;
+    return { total, pct: Math.round(total / LIMIT * 100), breakdown, limit: LIMIT };
+  } catch { return null; }
+}
+
+function StorageWarning({ onExport, onPurgeDone }) {
+  const C = useContext(ThemeCtx);
+  const [usage, setUsage] = useState(null);
+  const [dismissed, setDismissed] = useState(false);
+
+  useEffect(() => {
+    const u = getStorageUsage();
+    setUsage(u);
+  }, []);
+
+  if (!usage || dismissed || usage.pct < 75) return null;
+
+  const isCritical = usage.pct >= 90;
+  const color      = isCritical ? C.red : C.orange;
+  const bg         = isCritical ? C.red + "14" : C.orange + "14";
+  const border     = isCritical ? C.red + "40" : C.orange + "40";
+
+  const fmt = b => b >= 1024 * 1024
+    ? (b / 1024 / 1024).toFixed(1) + " MB"
+    : Math.round(b / 1024) + " KB";
+
+  // Find biggest contributor
+  const topKey = Object.entries(usage.breakdown).sort((a,b) => b[1]-a[1])[0];
+  const topLabel = topKey && topKey[0] === LS_KEY ? "task attivi"
+    : topKey && topKey[0] === LS_TRASH ? "cestino"
+    : topKey && topKey[0] === LS_ATT_TRASH ? "allegati nel cestino"
+    : "log eventi";
+
+  return (
+    <div style={{ margin:"0 0 16px 0", background:bg, border:"1px solid " + border, borderRadius:14, padding:"12px 14px" }}>
+      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom: isCritical ? 10 : 8 }}>
+        <span style={{ flexShrink:0, display:"flex", alignItems:"center", color }}>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+            <line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>
+          </svg>
+        </span>
+        <div style={{ flex:1 }}>
+          <span style={{ fontSize:13, fontWeight:600, color }}>
+            {isCritical ? "Memoria quasi esaurita" : "Memoria in esaurimento"} — {usage.pct}% usato ({fmt(usage.total)} / 5 MB)
+          </span>
+          <div style={{ fontSize:12, color:C.l2, marginTop:2 }}>
+            La parte più pesante è {topLabel} ({fmt(topKey[1])}). Esporta un backup e pulisci i completati.
+          </div>
+        </div>
+        <button onClick={() => setDismissed(true)}
+          style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:18, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
+      </div>
+      {/* Progress bar */}
+      <div style={{ height:4, borderRadius:2, background:C.s3, overflow:"hidden", marginBottom:10 }}>
+        <div style={{ height:"100%", width: usage.pct + "%", background:color, borderRadius:2, transition:"width 0.3s" }} />
+      </div>
+      <div style={{ display:"flex", gap:8 }}>
+        <button onClick={() => { onExport(); setDismissed(true); }}
+          style={{ fontSize:12, fontWeight:700, color:"#fff", background:color, border:"none", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
+          Esporta backup
+        </button>
+        <button onClick={() => { onPurgeDone(); const u = getStorageUsage(); setUsage(u); }}
+          style={{ fontSize:12, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
+          Svuota completati
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function BackupReminder({ onExport }) {
+  const C = useContext(ThemeCtx);
+  const SNOOZE_KEY = "tm_v1_backup_snoozed";
+  const [visible, setVisible] = useState(() => {
+    try {
+      // Snoozed oggi?
+      const snoozed = localStorage.getItem(SNOOZE_KEY);
+      if (snoozed === today) return false;
+      // Mai esportato?
+      const last = localStorage.getItem(LS_LAST_EXPORT);
+      if (!last) {
+        // Mostra solo se ci sono dati (almeno 3 task)
+        try {
+          const tasks = JSON.parse(localStorage.getItem(LS_KEY) || "[]");
+          return tasks.length >= 3;
+        } catch { return false; }
+      }
+      // Esportato più di 7 giorni fa?
+      const daysSince = Math.floor((Date.now() - parseInt(last)) / 86400000);
+      return daysSince >= 7;
+    } catch { return false; }
+  });
+
+  if (!visible) return null;
+
+  function handleExport() {
+    onExport();
+    setVisible(false);
+  }
+  function handleSnooze() {
+    try { localStorage.setItem(SNOOZE_KEY, today); } catch {}
+    setVisible(false);
+  }
+
+  return (
+    <div style={{ margin:"0 0 16px 0", background:`${C.yellow}14`, border:`1px solid ${C.yellow}40`, borderRadius:14, padding:"11px 14px", display:"flex", alignItems:"center", gap:10 }}>
+      <span style={{ flexShrink:0, display:"flex", alignItems:"center", color:C.yellow }}>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+          <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
+          <polyline points="17 21 17 13 7 13 7 21"/>
+          <polyline points="7 3 7 8 15 8"/>
+        </svg>
+      </span>
+      <div style={{ flex:1, minWidth:0 }}>
+        <span style={{ fontSize:13, color:C.l1, fontWeight:500 }}>
+          {(() => {
+            try {
+              const last = localStorage.getItem(LS_LAST_EXPORT);
+              if (!last) return "Non hai mai esportato un backup.";
+              const days = Math.floor((Date.now() - parseInt(last)) / 86400000);
+              const when = days === 1 ? "ieri" : days + " giorni fa";
+              return "Ultimo backup " + when + ". I dati sono solo nel browser.";
+            } catch { return "Non hai mai esportato un backup."; }
+          })()}
+        </span>
+      </div>
+      <button onClick={handleExport}
+        style={{ background:C.yellow, border:"none", color:"#000", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontSize:12, fontWeight:700, fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
+        Esporta ora
+      </button>
+      <button onClick={handleSnooze} title="Ricordamelo domani"
+        style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:18, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
+    </div>
+  );
+}
+
 function SavedIndicator({ savedAt }) {
   const C = useContext(ThemeCtx);
   const [visible, setVisible] = useState(false);
@@ -1617,6 +2198,351 @@ function SavedIndicator({ savedAt }) {
     }}>
       · salvato
     </span>
+  );
+}
+
+// ── Focus Mode ──
+function HelpModal({ onClose }) {
+  const C = useContext(ThemeCtx);
+  const groups = [
+    {
+      label: "Generale",
+      shortcuts: [
+        { keys: ["N"],          desc: "Nuovo task" },
+        { keys: ["F"],          desc: "Apri Focus mode" },
+        { keys: ["G"],          desc: "Alterna Agenda / Gantt" },
+        { keys: ["?"],          desc: "Mostra questa guida" },
+        { keys: ["Cmd", "K"],   desc: "Cerca" },
+        { keys: ["Esc"],        desc: "Chiudi pannello / modale / ricerca" },
+      ]
+    },
+    {
+      label: "Task selezionato",
+      shortcuts: [
+        { keys: ["E"],          desc: "Modifica" },
+        { keys: ["Enter"],      desc: "Segna come completato" },
+        { keys: ["⌫"],          desc: "Sposta nel cestino" },
+      ]
+    },
+    {
+      label: "Focus mode",
+      shortcuts: [
+        { keys: ["Spazio"],     desc: "Pausa / riprendi timer" },
+        { keys: ["Esc"],        desc: "Esci dal focus" },
+      ]
+    },
+  ];
+
+  const Key = ({ k }) => (
+    <span style={{ display:"inline-flex", alignItems:"center", justifyContent:"center", minWidth:26, height:22, padding:"0 7px", borderRadius:6, background:C.s3, border:`1px solid ${C.sep}`, fontSize:11, fontWeight:600, color:C.l2, fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif", letterSpacing:0 }}>
+      {k}
+    </span>
+  );
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px 24px 20px", width:420, maxWidth:"95vw", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
+          <span style={{ fontSize:17, fontWeight:700, color:C.l1 }}>Scorciatoie da tastiera</span>
+          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+        </div>
+        <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
+          {groups.map(g => (
+            <div key={g.label}>
+              <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1.1, marginBottom:10 }}>{g.label.toUpperCase()}</div>
+              <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+                {g.shortcuts.map((s, i) => (
+                  <div key={i} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
+                    <span style={{ fontSize:13, color:C.l2 }}>{s.desc}</span>
+                    <div style={{ display:"flex", gap:4, alignItems:"center", flexShrink:0 }}>
+                      {s.keys.map((k, ki) => (
+                        <React.Fragment key={ki}>
+                          {ki > 0 && <span style={{ fontSize:10, color:C.l3 }}>+</span>}
+                          <Key k={k} />
+                        </React.Fragment>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+        <div style={{ marginTop:20, paddingTop:16, borderTop:`1px solid ${C.sep}`, fontSize:11, color:C.l3, textAlign:"center" }}>
+          Le scorciatoie con lettera singola sono disattivate mentre scrivi in un campo testo.
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FocusPicker({ tasks, onPick, onClose }) {
+  const C = useContext(ThemeCtx);
+  const todayTasks = tasks.filter(t => t.progress < 100 && !t.waiting && t.type !== "inbox" && computeHz(t) === "today");
+  const weekTasks  = tasks.filter(t => t.progress < 100 && !t.waiting && t.type !== "inbox" && computeHz(t) === "week");
+  const candidates = todayTasks.length > 0 ? todayTasks : weekTasks;
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(24px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"28px 24px 24px", width:460, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20, flexShrink:0 }}>
+          <div>
+            <div style={{ fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Su cosa lavori adesso?</div>
+            <div style={{ fontSize:13, color:C.l3, marginTop:4 }}>{todayTasks.length > 0 ? "Task di oggi" : "Nessun task oggi — task della settimana"}</div>
+          </div>
+          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
+        </div>
+        {candidates.length === 0 ? (
+          <div style={{ textAlign:"center", padding:"32px 0", color:C.l3, fontSize:14 }}>Nessun task attivo da focalizzare.</div>
+        ) : (
+          <div style={{ overflowY:"auto", display:"flex", flexDirection:"column", gap:8 }}>
+            {candidates.map(t => {
+              const dL = t.end ? workDiff(today, t.end) : null;
+              const doneSubs = t.subtasks.filter(s => s.done).length;
+              return (
+                <div key={t.id} onClick={() => onPick(t.id)}
+                  style={{ background:C.s2, borderRadius:14, padding:"14px 16px", cursor:"pointer", border:`1.5px solid transparent`, transition:"all 0.15s" }}
+                  onMouseEnter={e => { e.currentTarget.style.background = C.s3; e.currentTarget.style.borderColor = t.color + "60"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = C.s2; e.currentTarget.style.borderColor = "transparent"; }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:9 }}>
+                    <div style={{ width:8, height:8, borderRadius:"50%", background:t.color, flexShrink:0 }} />
+                    <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
+                    {dL !== null && <span style={{ fontSize:11, color: dL <= 0 ? C.red : C.l3, flexShrink:0 }}>{dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : `${dL}gg lav.`}</span>}
+                  </div>
+                  {t.subtasks.length > 0 && (
+                    <div style={{ fontSize:12, color:C.l3, marginTop:5, paddingLeft:17 }}>{doneSubs}/{t.subtasks.length} sottotask</div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpdateProg, onPostpone }) {
+  const C = useContext(ThemeCtx);
+  const dL = task.end ? workDiff(today, task.end) : null;
+  const doneSubs = task.subtasks.filter(s => s.done).length;
+  const isComplete = task.progress >= 100;
+
+  // ── Timer state ──
+  const [timerTotal,   setTimerTotal]   = useState(0);     // seconds, 0 = not set
+  const [timerLeft,    setTimerLeft]    = useState(0);
+  const [timerRunning, setTimerRunning] = useState(false);
+  const [customMin,    setCustomMin]    = useState("");
+  const intervalRef = useRef(null);
+
+  useEffect(() => {
+    if (timerRunning && timerLeft > 0) {
+      intervalRef.current = setInterval(() => {
+        setTimerLeft(s => {
+          if (s <= 1) { clearInterval(intervalRef.current); setTimerRunning(false); return 0; }
+          return s - 1;
+        });
+      }, 1000);
+    }
+    return () => clearInterval(intervalRef.current);
+  }, [timerRunning]);
+
+  // Spazio = pausa/riprendi timer (via CustomEvent dall'handler globale)
+  useEffect(() => {
+    function onToggle() { if (timerTotal > 0 && !timerExpired) togglePause(); }
+    document.addEventListener("focus-toggle-timer", onToggle);
+    return () => document.removeEventListener("focus-toggle-timer", onToggle);
+  }, [timerTotal, timerExpired, timerRunning]);
+
+  function startTimer(minutes) {
+    const secs = minutes * 60;
+    setTimerTotal(secs);
+    setTimerLeft(secs);
+    setTimerRunning(true);
+  }
+  function resetTimer() {
+    clearInterval(intervalRef.current);
+    setTimerTotal(0); setTimerLeft(0); setTimerRunning(false); setCustomMin("");
+  }
+  function togglePause() {
+    setTimerRunning(r => !r);
+  }
+
+  const fmtTime = s => `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
+  const timerPct = timerTotal > 0 ? timerLeft / timerTotal : 1;
+  const timerExpired = timerTotal > 0 && timerLeft === 0;
+
+  // SVG ring geometry
+  const R = 88; const CIRC = 2 * Math.PI * R;
+  const ringColor = timerExpired ? C.l3 : timerLeft < 60 ? C.orange : C.blue;
+
+  // ── Auto-exit on complete ──
+  useEffect(() => {
+    if (task.progress >= 100) {
+      const t = setTimeout(onExit, 900);
+      return () => clearTimeout(t);
+    }
+  }, [task.progress]);
+
+  if (isComplete) return (
+    <div style={{ position:"fixed", inset:0, background:C.bg, zIndex:150, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:16 }}>
+      <div style={{ fontSize:48 }}>✦</div>
+      <div style={{ fontSize:22, fontWeight:700, color:C.l1, letterSpacing:-0.5 }}>Completato.</div>
+      <div style={{ fontSize:14, color:C.l3 }}>{task.title}</div>
+    </div>
+  );
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:C.bg, zIndex:150, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"24px", overflowY:"auto", animation:"focusIn 0.3s ease" }}>
+      <style>{`@keyframes focusIn{from{opacity:0;transform:scale(0.97)}to{opacity:1;transform:scale(1)}}`}</style>
+
+      {/* Top bar */}
+      <div style={{ position:"absolute", top:20, left:24, right:24, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+          <span style={{ fontSize:11, fontWeight:700, color:C.blue, letterSpacing:1 }}>FOCUS</span>
+        </div>
+        <button onClick={onExit}
+          style={{ background:"none", border:`1px solid ${C.sep}`, color:C.l3, borderRadius:10, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:500, fontFamily:"inherit", display:"flex", alignItems:"center", gap:6 }}>
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          Esci dal focus
+        </button>
+      </div>
+
+      <div style={{ width:"100%", maxWidth:500, display:"flex", flexDirection:"column", gap:24, alignItems:"center" }}>
+
+        {/* ── Timer ── */}
+        {timerTotal === 0 ? (
+          /* Setup */
+          <div style={{ textAlign:"center" }}>
+            <div style={{ fontSize:12, color:C.l3, marginBottom:12, fontWeight:500, letterSpacing:0.5 }}>IMPOSTA UN TIMER <span style={{ opacity:0.5 }}>· opzionale</span></div>
+            <div style={{ display:"flex", gap:8, justifyContent:"center", flexWrap:"wrap" }}>
+              {[15, 25, 50].map(m => (
+                <button key={m} onClick={() => startTimer(m)}
+                  style={{ padding:"9px 20px", borderRadius:12, border:`1px solid ${C.sep}`, background:C.s2, color:C.l1, cursor:"pointer", fontSize:14, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}
+                  onMouseEnter={e => { e.currentTarget.style.background = C.s3; e.currentTarget.style.borderColor = C.blue+"80"; }}
+                  onMouseLeave={e => { e.currentTarget.style.background = C.s2; e.currentTarget.style.borderColor = C.sep; }}>
+                  {m} min
+                </button>
+              ))}
+              <div style={{ display:"flex", alignItems:"center", gap:6, background:C.s2, borderRadius:12, border:`1px solid ${C.sep}`, padding:"4px 4px 4px 14px" }}>
+                <input
+                  type="number" min="1" max="180" value={customMin}
+                  onChange={e => setCustomMin(e.target.value)}
+                  onKeyDown={e => { if (e.key === "Enter" && +customMin > 0) startTimer(+customMin); }}
+                  placeholder="···"
+                  style={{ width:38, background:"none", border:"none", outline:"none", fontSize:14, color:C.l1, fontFamily:"inherit", textAlign:"center" }}
+                />
+                <button onClick={() => +customMin > 0 && startTimer(+customMin)}
+                  style={{ background: +customMin > 0 ? C.blue : C.s3, border:"none", color: +customMin > 0 ? "#fff" : C.l3, borderRadius:9, padding:"6px 12px", cursor: +customMin > 0 ? "pointer" : "default", fontSize:12, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}>
+                  via
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : (
+          /* Running / expired */
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:14 }}>
+            {/* SVG ring */}
+            <div style={{ position:"relative", width:200, height:200 }}>
+              <svg width="200" height="200" style={{ transform:"rotate(-90deg)" }}>
+                {/* Track */}
+                <circle cx="100" cy="100" r={R} fill="none" stroke={C.s3} strokeWidth="6" />
+                {/* Progress */}
+                <circle cx="100" cy="100" r={R} fill="none"
+                  stroke={ringColor} strokeWidth="6"
+                  strokeLinecap="round"
+                  strokeDasharray={CIRC}
+                  strokeDashoffset={CIRC * (1 - timerPct)}
+                  style={{ transition:"stroke-dashoffset 1s linear, stroke 0.5s" }}
+                />
+              </svg>
+              {/* Center content */}
+              <div style={{ position:"absolute", inset:0, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", gap:4 }}>
+                <div style={{ fontSize:42, fontWeight:300, color: timerExpired ? C.l3 : C.l1, letterSpacing:-1, fontVariantNumeric:"tabular-nums", lineHeight:1 }}>
+                  {fmtTime(timerLeft)}
+                </div>
+                <div style={{ fontSize:11, color:C.l3 }}>
+                  {timerExpired ? "tempo scaduto" : timerRunning ? "in corso" : "in pausa"}
+                </div>
+              </div>
+            </div>
+            {/* Timer controls */}
+            <div style={{ display:"flex", gap:8 }}>
+              {!timerExpired && (
+                <button onClick={togglePause}
+                  style={{ padding:"7px 18px", borderRadius:10, border:`1px solid ${C.sep}`, background:"none", color:C.l2, cursor:"pointer", fontSize:12, fontWeight:600, fontFamily:"inherit" }}>
+                  {timerRunning ? "⏸ Pausa" : "▶ Riprendi"}
+                </button>
+              )}
+              <button onClick={resetTimer}
+                style={{ padding:"7px 18px", borderRadius:10, border:`1px solid ${C.sep}`, background:"none", color:C.l3, cursor:"pointer", fontSize:12, fontWeight:500, fontFamily:"inherit" }}>
+                Azzera
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Task identity */}
+        <div style={{ textAlign:"center", width:"100%" }}>
+          <div style={{ width:10, height:10, borderRadius:"50%", background:task.color, margin:"0 auto 12px" }} />
+          <h2 style={{ margin:0, fontSize:24, fontWeight:700, color:C.l1, letterSpacing:-0.5, lineHeight:1.3 }}>{task.title}</h2>
+          {dL !== null && (
+            <div style={{ marginTop:6, fontSize:13, color: dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
+              {dL < 0 ? `Scaduto ${Math.abs(dL)} giorni fa` : dL === 0 ? "Scade oggi" : `${dL} giorni lavorativi alla scadenza`}
+            </div>
+          )}
+        </div>
+
+        {/* Progress — solo per task con sottotask */}
+        {task.subtasks.length > 0 && (
+        <div style={{ width:"100%" }}>
+          <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8 }}>
+            <span style={{ fontSize:13, color:C.l2 }}>Avanzamento</span>
+            <span style={{ fontSize:13, fontWeight:700, color:task.color }}>{task.progress}%</span>
+          </div>
+          <div style={{ background:C.s3, borderRadius:5, height:10, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
+          </div>
+          <div style={{ fontSize:12, color:C.l3, textAlign:"center", marginTop:5 }}>{doneSubs} di {task.subtasks.length} completati</div>
+        </div>
+        )}
+
+        {/* Subtasks */}
+        {task.subtasks.length > 0 && (
+          <div style={{ width:"100%", background:C.s1, borderRadius:16, overflow:"hidden", boxShadow:C.shadow }}>
+            {task.subtasks.map((s, idx) => (
+              <div key={s.id} onClick={() => onToggleSub(task.id, s.id)}
+                style={{ display:"flex", alignItems:"center", gap:12, padding:"12px 16px", borderBottom: idx < task.subtasks.length-1 ? `1px solid ${C.sep}` : "none", cursor:"pointer", transition:"background 0.1s" }}
+                onMouseEnter={e => { e.currentTarget.style.background = C.s2; }}
+                onMouseLeave={e => { e.currentTarget.style.background = ""; }}>
+                <div style={{ width:17, height:17, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.2s" }}>
+                  {s.done && <svg width="9" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                </div>
+                <span style={{ fontSize:14, color: s.done ? C.l3 : C.l1, textDecoration: s.done ? "line-through" : "none", flex:1 }}>{s.label}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* Actions */}
+        <div style={{ display:"flex", gap:10, width:"100%" }}>
+          <button onClick={() => onComplete(task.id)}
+            style={{ flex:1, padding:"14px", borderRadius:14, border:"none", background:`${C.green}20`, color:C.green, cursor:"pointer", fontSize:15, fontWeight:700, fontFamily:"inherit", transition:"all 0.2s" }}
+            onMouseEnter={e => e.currentTarget.style.background = `${C.green}35`}
+            onMouseLeave={e => e.currentTarget.style.background = `${C.green}20`}>
+            ✓ Fatto
+          </button>
+          <button onClick={() => onPostpone(task.id)}
+            style={{ padding:"14px 20px", borderRadius:14, border:`1px solid ${C.sep}`, background:"none", color:C.l3, cursor:"pointer", fontSize:14, fontWeight:500, fontFamily:"inherit", transition:"all 0.2s", whiteSpace:"nowrap" }}
+            onMouseEnter={e => { e.currentTarget.style.color = C.l1; e.currentTarget.style.borderColor = C.l2; }}
+            onMouseLeave={e => { e.currentTarget.style.color = C.l3; e.currentTarget.style.borderColor = C.sep; }}>
+            → Domani
+          </button>
+        </div>
+
+      </div>
+    </div>
   );
 }
 
@@ -1650,7 +2576,19 @@ function App() {
     try { return localStorage.getItem(LS_THEME) !== "light"; } catch(e) { return true; }
   });
 
+  const [templates, setTemplates] = useState(() => {
+    try { const r = localStorage.getItem(LS_TEMPLATES); return r ? JSON.parse(r) : []; } catch(e) { return []; }
+  });
+  useEffect(() => {
+    try { localStorage.setItem(LS_TEMPLATES, JSON.stringify(templates)); } catch(e) {}
+  }, [templates]);
+
+  const saveTemplate     = useCallback(tpl => setTemplates(ts => [...ts, tpl]), []);
+  const saveAllTemplates = useCallback(list => setTemplates(list), []);
+
   const [savedAt, setSavedAt] = useState(null);
+  const [events, setEvents]   = useState(() => readEventLog());
+  const [storageUsage, setStorageUsage] = useState(() => getStorageUsage());
   const [busyHours, setBusyHours] = useState(function() {
     try {
       var raw = localStorage.getItem(LS_BUSY + "_" + today);
@@ -1663,15 +2601,15 @@ function App() {
 
   // ── Persistence: save to localStorage on every change ──
   useEffect(() => {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(tasks)); setSavedAt(Date.now()); } catch(e) {}
+    try { localStorage.setItem(LS_KEY, JSON.stringify(tasks)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
   }, [tasks]);
 
   useEffect(() => {
-    try { localStorage.setItem(LS_TRASH, JSON.stringify(trash)); setSavedAt(Date.now()); } catch(e) {}
+    try { localStorage.setItem(LS_TRASH, JSON.stringify(trash)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
   }, [trash]);
 
   useEffect(() => {
-    try { localStorage.setItem(LS_ATT_TRASH, JSON.stringify(attTrash)); setSavedAt(Date.now()); } catch(e) {}
+    try { localStorage.setItem(LS_ATT_TRASH, JSON.stringify(attTrash)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
   }, [attTrash]);
 
   useEffect(() => {
@@ -1683,68 +2621,91 @@ function App() {
   const [editTask, setEditTask] = useState(null);
   const [showReview, setShowReview] = useState(false);
   const [showTrash, setShowTrash]   = useState(false);
-  const [viewMode, setViewMode]     = useState("agenda"); // "agenda" | "gantt"
+  const [showHelp, setShowHelp]     = useState(false);
+  const [viewMode, setViewMode]     = useState("agenda");
   const [query, setQuery]           = useState("");
+  const [focusTaskId, setFocusTaskId] = useState(null);
+  const [showTemplates, setShowTemplates] = useState(false); // null | "picking" | task id
   const searchRef = useRef(null);
   const importRef = useRef(null);
 
   const C = isDark ? DARK : LIGHT;
 
   // ── Trash mutators ──
-  const moveToTrash = id => {
-    const t = tasks.find(t => t.id === id);
-    if (!t) return;
-    setTrash(tr => [...tr, { ...t, deletedAt: new Date().toISOString() }]);
-    setTasks(ts => ts.filter(t => t.id !== id));
-    setSel(null);
-  };
-  const trashAll = ids => {
+  const moveToTrash = useCallback(id => {
+    appendEvent("trashed", id);
+    setEvents(readEventLog());
+    setTasks(ts => {
+      const t = ts.find(t => t.id === id);
+      if (!t) return ts;
+      setTrash(tr => [...tr, { ...t, deletedAt: new Date().toISOString() }]);
+      setSel(null);
+      return ts.filter(t => t.id !== id);
+    });
+  }, []);
+  const trashAll = useCallback(ids => {
     const now = new Date().toISOString();
-    const toMove = tasks.filter(t => ids.includes(t.id));
-    setTrash(tr => [...tr, ...toMove.map(t => ({ ...t, deletedAt: now }))]);
-    setTasks(ts => ts.filter(t => !ids.includes(t.id)));
-  };
-  const restoreFromTrash = id => {
-    const t = trash.find(t => t.id === id);
-    if (!t) return;
-    const { deletedAt, ...restored } = t;
-    setTasks(ts => [...ts, restored]);
-    setTrash(tr => tr.filter(t => t.id !== id));
-  };
-  const deleteFromTrash = id => {
-    const t = trash.find(t => t.id === id);
-    if (t) (t.attachments || []).forEach(a => idbDelete(a.id));
-    setTrash(tr => tr.filter(t => t.id !== id));
-  };
-  const emptyTrash = () => {
-    trash.forEach(t => (t.attachments || []).forEach(a => idbDelete(a.id)));
-    attTrash.forEach(a => idbDelete(a.id));
-    setTrash([]);
-    setAttTrash([]);
-  };
+    setTasks(ts => {
+      const toMove = ts.filter(t => ids.includes(t.id));
+      setTrash(tr => [...tr, ...toMove.map(t => ({ ...t, deletedAt: now }))]);
+      return ts.filter(t => !ids.includes(t.id));
+    });
+  }, []);
+  const restoreFromTrash = useCallback(id => {
+    setTrash(tr => {
+      const t = tr.find(t => t.id === id);
+      if (!t) return tr;
+      const { deletedAt, ...restored } = t;
+      setTasks(ts => [...ts, restored]);
+      return tr.filter(t => t.id !== id);
+    });
+  }, []);
+  const deleteFromTrash = useCallback(id => {
+    setTrash(tr => {
+      const t = tr.find(t => t.id === id);
+      if (t) (t.attachments || []).forEach(a => idbDelete(a.id));
+      return tr.filter(t => t.id !== id);
+    });
+  }, []);
+  const emptyTrash = useCallback(() => {
+    setTrash(tr => { tr.forEach(t => (t.attachments || []).forEach(a => idbDelete(a.id))); return []; });
+    setAttTrash(at => { at.forEach(a => idbDelete(a.id)); return []; });
+  }, []);
+
+  // Purge all completed tasks (progress >= 100) — frees localStorage space
+  const purgeDone = useCallback(() => {
+    setTasks(ts => {
+      const done = ts.filter(t => t.progress >= 100);
+      const now  = new Date().toISOString();
+      setTrash(tr => [...tr, ...done.map(t => ({ ...t, deletedAt: now }))]);
+      return ts.filter(t => t.progress < 100);
+    });
+  }, []);
 
   // ── Attachment trash mutators ──
-  const trashAttachment = (taskId, taskTitle, meta) => {
+  const trashAttachment = useCallback((taskId, taskTitle, meta) => {
     setTasks(ts => ts.map(t => t.id === taskId
       ? { ...t, attachments: t.attachments.filter(a => a.id !== meta.id) }
       : t
     ));
     setAttTrash(at => [...at, { ...meta, taskId, taskTitle, deletedAt: new Date().toISOString() }]);
-  };
-  const restoreAttachment = id => {
-    const att = attTrash.find(a => a.id === id);
-    if (!att) return;
-    const { taskId, taskTitle, deletedAt, ...meta } = att;
-    setTasks(ts => ts.map(t => t.id === taskId
-      ? { ...t, attachments: [...(t.attachments || []), meta] }
-      : t
-    ));
-    setAttTrash(at => at.filter(a => a.id !== id));
-  };
-  const deleteAttachment = id => {
+  }, []);
+  const restoreAttachment = useCallback(id => {
+    setAttTrash(at => {
+      const att = at.find(a => a.id === id);
+      if (!att) return at;
+      const { taskId, taskTitle, deletedAt, ...meta } = att;
+      setTasks(ts => ts.map(t => t.id === taskId
+        ? { ...t, attachments: [...(t.attachments || []), meta] }
+        : t
+      ));
+      return at.filter(a => a.id !== id);
+    });
+  }, []);
+  const deleteAttachment = useCallback(id => {
     idbDelete(id);
     setAttTrash(at => at.filter(a => a.id !== id));
-  };
+  }, []);
 
   // ── Export / Import ──
   function exportJSON() {
@@ -1754,6 +2715,7 @@ function App() {
     const date = new Date().toISOString().slice(0,10);
     a.href = url; a.download = `time-manager-${date}.json`;
     a.click(); URL.revokeObjectURL(url);
+    try { localStorage.setItem(LS_LAST_EXPORT, String(Date.now())); } catch {}
   }
 
   function importJSON(e) {
@@ -1784,41 +2746,96 @@ function App() {
     const waiting    = active.filter(t => t.waiting && t.type !== "inbox");
     const actionable = active.filter(t => !t.waiting);
     const inbox   = actionable.filter(t => t.type === "inbox");
-    const today_  = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "today");
-    const week    = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "week");
-    const month   = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "month");
-    const backlog = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "backlog");
+    const today_  = smartSort(actionable.filter(t => t.type !== "inbox" && computeHz(t) === "today"));
+    const week    = smartSort(actionable.filter(t => t.type !== "inbox" && computeHz(t) === "week"));
+    const month   = smartSort(actionable.filter(t => t.type !== "inbox" && computeHz(t) === "month"));
+    const backlog = smartSort(actionable.filter(t => t.type !== "inbox" && computeHz(t) === "backlog"));
     const done    = tasks.filter(t => t.progress >= 100);
     const load    = today_.reduce((s, t) => s + (DURATION_MAP[t.duration] ? DURATION_MAP[t.duration].hours : 0), 0);
-    const projects = actionable.filter(t => t.type === "project");
+    const projects = actionable.filter(t => t.subtasks && t.subtasks.length > 0);
     return { inbox, today: today_, week, month, backlog, done, load, projects, waiting };
   }, [tasks]);
 
   const freeHours = Math.max(0, 8 - busyHours);
 
-  const suggestions = useMemo(() => computeSuggestions({
-    todayItems:   groups.today,
-    inboxItems:   groups.inbox,
-    projects:     groups.projects,
-    backlogItems: groups.backlog,
-    waitingItems: groups.waiting,
-    load:         groups.load,
-    freeHours:    freeHours,
-  }), [groups, freeHours]);
+  const suggestions = useMemo(() => {
+    const system = computeSuggestions({
+      todayItems:   groups.today,
+      inboxItems:   groups.inbox,
+      projects:     groups.projects,
+      backlogItems: groups.backlog,
+      waitingItems: groups.waiting,
+      load:         groups.load,
+      freeHours:    freeHours,
+    });
+    const behavioral = computeBehavioralSuggestions(tasks, events);
+    return [...behavioral, ...system];
+  }, [groups, freeHours, tasks, events]);
+
+  const handleWhisperAction = useCallback(act => {
+    if (act.type === "trash") moveToTrash(act.taskId);
+    // dismiss_postpone and dismiss_stale just close the suggestion (handled in SuggestionWhisper)
+  }, [moveToTrash]);
 
   const selTask = tasks.find(t => t.id === sel);
 
-  // ── Keyboard shortcut: Cmd/Ctrl+K to focus search ──
+  // ── Keyboard shortcuts ──
   useEffect(() => {
+    function isTyping() {
+      const tag = document.activeElement ? document.activeElement.tagName : "";
+      return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" ||
+             document.activeElement.isContentEditable;
+    }
     function onKey(e) {
+      // Cmd/Ctrl+K — cerca (sempre attivo)
       if ((e.metaKey || e.ctrlKey) && e.key === "k") {
         e.preventDefault();
         if (searchRef.current) { searchRef.current.focus(); searchRef.current.select(); }
+        return;
+      }
+      // Esc — chiudi tutto (sempre attivo)
+      if (e.key === "Escape") {
+        if (showHelp)    { setShowHelp(false);    return; }
+        if (editTask)    { setEditTask(null);      return; }
+        if (showForm)    { setShowForm(false);     return; }
+        if (showReview)  { setShowReview(false);   return; }
+        if (showTrash)   { setShowTrash(false);    return; }
+        if (focusTaskId) { setFocusTaskId(null);   return; }
+        if (query)       { setQuery("");           return; }
+        if (sel)         { setSel(null);           return; }
+        return;
+      }
+      // Scorciatoie lettera singola — disabilitate mentre si scrive
+      if (isTyping()) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      // Focus mode shortcuts
+      if (focusTaskId && focusTaskId !== "picking") {
+        if (e.key === " ") { e.preventDefault(); document.dispatchEvent(new CustomEvent("focus-toggle-timer")); return; }
+        return; // in focus mode blocco tutto il resto
+      }
+
+      switch (e.key) {
+        case "n": case "N":
+          e.preventDefault(); setShowForm(true); break;
+        case "f": case "F":
+          e.preventDefault(); setFocusTaskId("picking"); break;
+        case "g": case "G":
+          e.preventDefault(); setViewMode(v => v === "gantt" ? "agenda" : "gantt"); break;
+        case "?":
+          e.preventDefault(); setShowHelp(h => !h); break;
+        case "e": case "E":
+          if (sel) { e.preventDefault(); const t = tasks.find(t => t.id === sel); if (t) setEditTask({ ...t }); } break;
+        case "Enter":
+          if (sel) { e.preventDefault(); completeTask(sel); setSel(null); } break;
+        case "Backspace": case "Delete":
+          if (sel) { e.preventDefault(); moveToTrash(sel); } break;
+        default: break;
       }
     }
     document.addEventListener("keydown", onKey);
-    return function() { document.removeEventListener("keydown", onKey); };
-  }, []);
+    return () => document.removeEventListener("keydown", onKey);
+  }, [sel, query, showForm, editTask, showReview, showTrash, showHelp, focusTaskId, tasks]);
 
   const searchResults = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -1834,63 +2851,113 @@ function App() {
   }, [query, tasks]);
 
   // ── Mutators ──
-  const saveNew  = f => { setTasks(ts => [...ts, { waiting:false, waitingFor:"", waitingSince:"", ...f, id:Date.now() }]); setShowForm(false); };
-  const saveEdit = f => {
-    const prog = f.subtasks.length ? calcProg(f.subtasks) : f.progress;
-    setTasks(ts => ts.map(t => t.id === f.id ? { ...f, progress:prog } : t));
-    setEditTask(null);
-  };
+  const logEvent = useCallback((type, taskId) => {
+    appendEvent(type, taskId);
+    setEvents(readEventLog());
+  }, []);
 
-  const addSub  = (tid, label) => setTasks(ts => ts.map(t => {
+  const deriveType = f => f.type === "inbox" ? "inbox" : f.subtasks && f.subtasks.length > 0 ? "project" : "action";
+  const saveNew  = useCallback(f => {
+    const id = Date.now();
+    const t = { waiting:false, waitingFor:"", waitingSince:"", ...f, id };
+    setTasks(ts => [...ts, { ...t, type:deriveType(t) }]);
+    setShowForm(false);
+    appendEvent("created", id);
+    setEvents(readEventLog());
+  }, []);
+  const saveEdit = useCallback(f => {
+    const prog = f.subtasks.length ? calcProg(f.subtasks) : f.progress;
+    setTasks(ts => ts.map(t => t.id === f.id ? { ...f, progress:prog, type:deriveType(f) } : t));
+    setEditTask(null);
+  }, []);
+
+  const addSub  = useCallback((tid, label) => setTasks(ts => ts.map(t => {
     if (t.id !== tid) return t;
     const subs = [...t.subtasks, { id:Date.now(), label, done:false }];
-    return { ...t, subtasks:subs, progress:calcProg(subs) };
-  }));
-  const delSub  = (tid, sid) => setTasks(ts => ts.map(t => {
+    return { ...t, subtasks:subs, progress:calcProg(subs), type:"project" };
+  })), []);
+  const delSub  = useCallback((tid, sid) => setTasks(ts => ts.map(t => {
     if (t.id !== tid) return t;
     const subs = t.subtasks.filter(s => s.id !== sid);
-    return { ...t, subtasks:subs, progress:calcProg(subs) };
-  }));
-  const toggleSub = (tid, sid) => setTasks(ts => ts.map(t => {
+    return { ...t, subtasks:subs, progress:calcProg(subs), type: subs.length > 0 ? "project" : "action" };
+  })), []);
+  const toggleSub = useCallback((tid, sid) => setTasks(ts => ts.map(t => {
     if (t.id !== tid) return t;
     const subs = t.subtasks.map(s => s.id === sid ? { ...s, done:!s.done } : s);
     return { ...t, subtasks:subs, progress:calcProg(subs) };
-  }));
-  const setNext = (tid, sid) => setTasks(ts => ts.map(t => {
+  })), []);
+  const renameSub = useCallback((tid, sid, label) => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    return { ...t, subtasks: t.subtasks.map(s => s.id === sid ? { ...s, label } : s) };
+  })), []);
+  const setNext = useCallback((tid, sid) => setTasks(ts => ts.map(t => {
     if (t.id !== tid) return t;
     const found   = t.subtasks.find(s => s.id === sid);
     const already = found ? found.next : false;
     return { ...t, subtasks:t.subtasks.map(s => ({ ...s, next:!already && s.id === sid })) };
-  }));
-  const updateProg     = (tid, v) => setTasks(ts => ts.map(t => t.id === tid && !t.subtasks.length ? { ...t, progress:v } : t));
-  const completeTask   = tid => setTasks(ts => ts.map(t => t.id === tid ? { ...t, progress:100 } : t));
-  const uncompleteTask = tid => { setTasks(ts => ts.map(t => t.id === tid ? { ...t, progress:0 } : t)); };
+  })), []);
+  const updateProg     = useCallback((tid, v) => setTasks(ts => ts.map(t => t.id === tid && !t.subtasks.length ? { ...t, progress:v } : t)), []);
+  const completeTask = useCallback(tid => {
+    appendEvent("completed", tid);
+    setEvents(readEventLog());
+    setTasks(ts => {
+      const t = ts.find(t => t.id === tid);
+      if (t && t.recurrence && t.end) {
+        const nextEnd = nextRecurrenceDate(t.end, t.recurrence);
+        const nextStart = nextEnd && t.start ? nextRecurrenceDate(t.start, t.recurrence) : nextEnd;
+        const next = {
+          ...t,
+          id: Date.now(),
+          progress: 0,
+          end: nextEnd || t.end,
+          start: nextStart || t.start,
+          subtasks: t.subtasks.map(s => ({ ...s, done:false, next:false })),
+          pinned: false,
+        };
+        return [...ts.map(x => x.id === tid ? { ...x, progress:100 } : x), next];
+      }
+      return ts.map(x => x.id === tid ? { ...x, progress:100 } : x);
+    });
+  }, []);
+  const uncompleteTask = useCallback(tid => setTasks(ts => ts.map(t => t.id === tid ? { ...t, progress:0 } : t)), []);
+  const postponeTask   = useCallback(tid => {
+    appendEvent("postponed", tid);
+    setEvents(readEventLog());
+    setTasks(ts => ts.map(t => t.id === tid ? { ...t, end:T(1) } : t));
+  }, []);
 
-  const addAttachment    = (tid, meta) => setTasks(ts => ts.map(t => t.id === tid ? { ...t, attachments:[...(t.attachments||[]), meta] } : t));
-  const removeAttachment = (taskId, meta) => trashAttachment(taskId, (tasks.find(t => t.id === taskId) || {}).title || "", meta);
-  const toggleWaiting = tid => setTasks(ts => ts.map(t => {
+  const addAttachment    = useCallback((tid, meta) => setTasks(ts => ts.map(t => t.id === tid ? { ...t, attachments:[...(t.attachments||[]), meta] } : t)), []);
+  const removeAttachment = useCallback((taskId, meta) => {
+    setTasks(ts => {
+      const t = ts.find(t => t.id === taskId);
+      trashAttachment(taskId, t ? t.title : "", meta);
+      return ts;
+    });
+  }, [trashAttachment]);
+  const toggleWaiting = useCallback(tid => setTasks(ts => ts.map(t => {
     if (t.id !== tid) return t;
     const nowWaiting = !t.waiting;
     return { ...t, waiting:nowWaiting, waitingSince:nowWaiting ? today : "", waitingFor:nowWaiting ? t.waitingFor : "" };
-  }));
-  const quickAdd = title => setTasks(ts => [...ts, { ...EMPTY_TASK, id:Date.now(), title, type:"inbox", urgency:null, importance:null }]);
-  const newEmpty = () => ({ ...EMPTY_TASK, start:today, color: PALETTE[Math.floor(Math.random() * PALETTE.length)] });
+  })), []);
+  const togglePin = useCallback(tid => setTasks(ts => ts.map(t => t.id === tid ? { ...t, pinned: !t.pinned } : t)), []);
+  const quickAdd  = useCallback(title => setTasks(ts => [...ts, { ...EMPTY_TASK, id:Date.now(), title, type:"inbox", urgency:null, importance:null }]), []);
+  const newEmpty  = useCallback(() => ({ ...EMPTY_TASK, start:today, color: PALETTE[Math.floor(Math.random() * PALETTE.length)] }), []);
 
-  const handleReviewDecide = (tid, action, date) => {
+  const handleReviewDecide = useCallback((tid, action, date) => {
     setTasks(ts => ts.map(t => {
       if (t.id !== tid) return t;
       if (action === "done")     return { ...t, progress:100 };
       if (action === "postpone") return { ...t, end:date };
       return t;
     }));
-  };
+  }, []);
 
   // Called when user classifies an inbox task from within EndOfDayReview
-  const handleClassifyInbox = f => {
+  const handleClassifyInbox = useCallback(f => {
     const prog = f.subtasks.length ? calcProg(f.subtasks) : f.progress;
     const hz   = f.urgency && f.importance ? baseHz(f.urgency, f.importance) : "backlog";
     setTasks(ts => ts.map(t => t.id === f.id ? { ...f, progress:prog, horizon:hz } : t));
-  };
+  }, []);
 
   return (
     <ThemeCtx.Provider value={C}>
@@ -1905,6 +2972,8 @@ function App() {
         input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:${C.s3};outline:none}
         input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;cursor:pointer;margin-top:-6px}
         .agenda-row:hover{background:${C.s2}!important}
+        .agenda-row:hover .pin-btn{opacity:0.35!important}
+        .agenda-row:hover .pin-btn:hover{opacity:1!important}
       `}</style>
 
       {/* Header */}
@@ -1941,6 +3010,14 @@ function App() {
               />
               <span style={{ fontSize:11, color:C.l3, whiteSpace:"nowrap" }}>h occupate</span>
             </div>
+
+            {/* Templates */}
+            <button onClick={() => setShowTemplates(true)} title="Modelli di sottotask"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
+              </svg>
+            </button>
 
             {/* Trash button */}
             <button onClick={() => setShowTrash(true)} title="Cestino"
@@ -2019,11 +3096,25 @@ function App() {
               )}
             </button>
 
+            {/* Help */}
+            <button onClick={() => setShowHelp(true)} title="Scorciatoie da tastiera (?)"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l3, flexShrink:0, fontSize:14, fontWeight:600, fontFamily:"inherit" }}>
+              ?
+            </button>
+
             {/* Review */}
             <button onClick={() => setShowReview(true)} title="Chiusura giornata"
               style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l2, flexShrink:0 }}>
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </button>
+
+            {/* Focus */}
+            <button onClick={() => setFocusTaskId("picking")} title="Modalità focus"
+              style={{ background: focusTaskId && focusTaskId !== "picking" ? `${C.blue}22` : "none", border:`1px solid ${focusTaskId && focusTaskId !== "picking" ? C.blue : C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color: focusTaskId && focusTaskId !== "picking" ? C.blue : C.l2, flexShrink:0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>
               </svg>
             </button>
 
@@ -2063,7 +3154,7 @@ function App() {
                               <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
                               <span style={{ fontSize:13, fontWeight:600, color:C.l1 }}>{task.title}</span>
                               <span style={{ fontSize:11, color:C.l3, marginLeft:"auto" }}>
-                                {task.type === "inbox" ? "Inbox" : task.type === "project" ? "Progetto" : "Azione"}
+                                {task.type === "inbox" ? "Inbox" : task.subtasks && task.subtasks.length > 0 ? "Progetto" : "Azione"}
                               </span>
                               {task.end && <span style={{ fontSize:11, color:C.l3 }}>→ {fmtDate(task.end)}</span>}
                             </div>
@@ -2096,20 +3187,22 @@ function App() {
         <div onClick={() => setSel(null)} style={{ flex:1, overflowY:"auto", padding:"20px 24px" }}>
           <div onClick={e => e.stopPropagation()}>
             <QuickCapture onAdd={quickAdd} />
-            <SuggestionWhisper suggestions={suggestions} />
+            <StorageWarning onExport={exportJSON} onPurgeDone={purgeDone} />
+            <BackupReminder onExport={exportJSON} />
+            <SuggestionWhisper suggestions={suggestions} onAction={handleWhisperAction} />
           </div>
 
           {groups.inbox.length > 0 && (
-            <AgendaSection items={groups.inbox} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Inbox" color={C.yellow} />
+            <AgendaSection items={groups.inbox} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Inbox" color={C.yellow} onTogglePin={togglePin} />
           )}
           <AgendaSection items={groups.today} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask}
-            label="Oggi" color={C.red}
+            label="Oggi" color={C.red} onTogglePin={togglePin}
             extra={groups.load > freeHours ? { text:`~${Math.round(groups.load)}h · overcommitment`, color:C.red } : groups.load > 0 ? { text:`~${groups.load < 1 ? "<1" : Math.round(groups.load)}h stimato`, color:C.l3 } : null} />
-          <AgendaSection items={groups.week} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Questa settimana" color={C.orange} />
-          <AgendaSection items={groups.month} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Prossime settimane" color={C.blue} />
-          <AgendaSection items={groups.backlog} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Backlog" color={C.l3} />
+          <AgendaSection items={groups.week} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Questa settimana" color={C.orange} onTogglePin={togglePin} />
+          <AgendaSection items={groups.month} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Prossime settimane" color={C.blue} onTogglePin={togglePin} />
+          <AgendaSection items={groups.backlog} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Backlog" color={C.l3} onTogglePin={togglePin} />
           {groups.waiting.length > 0 && (
-            <AgendaSection items={groups.waiting} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="In attesa" color={C.teal} />
+            <AgendaSection items={groups.waiting} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="In attesa" color={C.teal} onTogglePin={togglePin} />
           )}
 
           {groups.done.length > 0 && (
@@ -2130,22 +3223,38 @@ function App() {
               </svg>
             </div>
           )}
+
+          <div style={{ textAlign:"center", padding:"28px 24px 20px", userSelect:"none" }}>
+            <span style={{ fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif", fontStyle:"normal", fontWeight:300, fontSize:12, color:C.l3, opacity:0.4, letterSpacing:0.4 }}>
+              Designed by Duccio Ruozzi and Claude in 2026
+            </span>
+          </div>
         </div>
         )} {/* end main view */}
 
         {selTask && (
           <DetailPanel task={selTask} onClose={() => setSel(null)}
             onEdit={() => setEditTask({ ...selTask })} onDelete={moveToTrash} onComplete={completeTask} onUncomplete={uncompleteTask}
-            onToggleSub={toggleSub} onAddSub={addSub} onDelSub={delSub} onSetNext={setNext}
+            onToggleSub={toggleSub} onAddSub={addSub} onDelSub={delSub} onSetNext={setNext} onRenameSub={renameSub}
             onUpdateProg={updateProg} onToggleWaiting={toggleWaiting}
             onAddAttachment={addAttachment} onRemoveAttachment={removeAttachment} />
         )}
       </div>
 
-      {showForm   && <TaskForm initial={newEmpty()}  onSave={saveNew}  onClose={() => setShowForm(false)} />}
-      {editTask   && <TaskForm initial={editTask}  onSave={saveEdit} onClose={() => setEditTask(null)} isEdit />}
+      {showForm   && <TaskForm initial={newEmpty()} onSave={saveNew} onClose={() => setShowForm(false)} templates={templates} onSaveTemplate={saveTemplate} />}
+      {editTask   && <TaskForm initial={editTask} onSave={saveEdit} onClose={() => setEditTask(null)} isEdit templates={templates} onSaveTemplate={saveTemplate} />}
       {showReview && <EndOfDayReview tasks={tasks} onClose={() => setShowReview(false)} onDecide={handleReviewDecide} onClassifyInbox={handleClassifyInbox} />}
       {showTrash  && <TrashModal trash={trash} attTrash={attTrash} onClose={() => setShowTrash(false)} onRestore={restoreFromTrash} onDeleteOne={deleteFromTrash} onRestoreAtt={restoreAttachment} onDeleteAtt={deleteAttachment} onEmpty={emptyTrash} />}
+      {showHelp   && <HelpModal onClose={() => setShowHelp(false)} />}
+      {showTemplates && <TemplatesModal templates={templates} onClose={() => setShowTemplates(false)} onSave={saveAllTemplates} />}
+      {focusTaskId === "picking" && <FocusPicker tasks={tasks} onPick={id => setFocusTaskId(id)} onClose={() => setFocusTaskId(null)} />}
+      {focusTaskId && focusTaskId !== "picking" && (() => {
+        const ft = tasks.find(t => t.id === focusTaskId);
+        if (!ft) { setFocusTaskId(null); return null; }
+        return <FocusMode task={ft} onExit={() => setFocusTaskId(null)}
+          onComplete={completeTask} onUncomplete={uncompleteTask}
+          onToggleSub={toggleSub} onUpdateProg={updateProg} onPostpone={postponeTask} />;
+      })()}
     </div>
     </ThemeCtx.Provider>
   );
