@@ -1,0 +1,2157 @@
+<!--
+  Time Manager — personal task manager
+  Basato sulla matrice Urgenza × Importanza (Eisenhower)
+  v1.0 · MIT License · https://github.com/tuonome/time-manager
+-->
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Time Manager</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { overflow: hidden; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+<script type="text/babel">
+const { useState, useMemo, useContext, createContext, useEffect, useRef } = React;
+
+// ── Storage key ──
+const LS_KEY       = "tm_v1_tasks";
+const LS_THEME     = "tm_v1_theme";
+const LS_TRASH     = "tm_v1_trash";
+const LS_ATT_TRASH = "tm_v1_att_trash";
+const LS_DONE_HIDE = "tm_v1_done_hidden";
+const LS_BUSY      = "tm_v1_busy"; // key: "tm_v1_busy_YYYY-MM-DD"
+
+// ── IndexedDB — attachment storage ──
+const IDB_NAME  = "tm_files_v1";
+const IDB_STORE = "attachments";
+
+function openDB() {
+  return new Promise(function(resolve, reject) {
+    var req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = function(e) {
+      var db = e.target.result;
+      if (!db.objectStoreNames.contains(IDB_STORE))
+        db.createObjectStore(IDB_STORE, { keyPath:"id" });
+    };
+    req.onsuccess = function(e) { resolve(e.target.result); };
+    req.onerror   = function(e) { reject(e.target.error); };
+  });
+}
+
+function idbSave(record) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).put(record);
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror    = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function idbGet(id) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx  = db.transaction(IDB_STORE, "readonly");
+      var req = tx.objectStore(IDB_STORE).get(id);
+      req.onsuccess = function(e) { resolve(e.target.result); };
+      req.onerror   = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+function idbDelete(id) {
+  return openDB().then(function(db) {
+    return new Promise(function(resolve, reject) {
+      var tx = db.transaction(IDB_STORE, "readwrite");
+      tx.objectStore(IDB_STORE).delete(id);
+      tx.oncomplete = function() { resolve(); };
+      tx.onerror    = function(e) { reject(e.target.error); };
+    });
+  });
+}
+
+// ── Design System — Apple Human Interface Guidelines system colors ──
+const DARK = {
+  red:    "#FF453A", orange: "#FF9F0A", yellow: "#FFD60A",
+  green:  "#32D74B", blue:   "#0A84FF", purple: "#BF5AF2",
+  teal:   "#5AC8FA", muted:  "#8E8E93",
+  bg:"#000000", s1:"#1C1C1E", s2:"#2C2C2E", s3:"#3A3A3C",
+  sep:"rgba(84,84,88,0.65)",
+  l1:"#FFFFFF", l2:"rgba(235,235,245,0.6)", l3:"rgba(235,235,245,0.3)",
+  header:"rgba(28,28,30,0.92)",
+  shadow:"none",
+};
+const LIGHT = {
+  red:    "#FF3B30", orange: "#FF6B00", yellow: "#B8860B",
+  green:  "#248A3D", blue:   "#007AFF", purple: "#8944AB",
+  teal:   "#0071A4", muted:  "#6C6C70",
+  bg:"#F2F2F7", s1:"#FFFFFF", s2:"#F0F0F5", s3:"#D1D1D6",
+  sep:"rgba(60,60,67,0.15)",
+  l1:"#000000", l2:"rgba(60,60,67,0.65)", l3:"rgba(60,60,67,0.38)",
+  header:"rgba(242,242,247,0.92)",
+  shadow:"0 1px 4px rgba(0,0,0,0.07), 0 4px 16px rgba(0,0,0,0.04)",
+};
+
+const ThemeCtx = createContext(DARK);
+
+const HZ = {
+  today:   { label:"Oggi"               },
+  week:    { label:"Questa settimana"   },
+  month:   { label:"Prossime settimane" },
+  backlog: { label:"Backlog"            },
+};
+const HZ_COLORS = { today:"red", week:"orange", month:"blue", backlog:"muted" };
+const hzColor = (hz, C) => C[HZ_COLORS[hz]] || C.muted;
+
+const PALETTE = ["#FF453A","#FF9F0A","#FFD60A","#32D74B","#0A84FF","#BF5AF2","#64D2FF","#FF6961"];
+
+const DURATIONS = [
+  { id:"quick", icon:"bolt",      label:"< 30 min",     hours:0.5 },
+  { id:"hour1", icon:"clock",     label:"1 ora",         hours:1   },
+  { id:"hour2", icon:"timer",     label:"2 ore",         hours:2   },
+  { id:"block", icon:"blocks",    label:"Mezza giornata",hours:4   },
+  { id:"deep",  icon:"repeat",    label:"Più sessioni",  hours:0   },
+];
+const ACTION_DURATIONS = ["quick","hour1","hour2","block"];
+const DURATION_MAP = Object.fromEntries(DURATIONS.map(d => [d.id, d]));
+
+const MATRIX = [
+  { u:1,i:2, label:"Pianifica",  sub:"Importante, non urgente",    color:DARK.blue,   hz:"week",    q:"Q2" },
+  { u:2,i:2, label:"Fai subito", sub:"Urgente e importante",       color:DARK.red,    hz:"today",   q:"Q1" },
+  { u:1,i:1, label:"Parcheggia", sub:"Non urgente, non importante", color:DARK.muted,  hz:"backlog", q:"Q4" },
+  { u:2,i:1, label:"Sbriga",     sub:"Urgente ma non importante",  color:DARK.purple, hz:"week",    q:"Q3" },
+];
+
+const getCell = (u,i) => MATRIX.find(c=>c.u===u&&c.i===i);
+const baseHz  = (u,i) => { const c = getCell(u,i); return c ? c.hz : "backlog"; };
+const RANK    = {backlog:0,month:1,week:2,today:3};
+const maxHz   = (a,b) => RANK[a]>RANK[b]?a:b;
+
+const today   = new Date().toISOString().split("T")[0];
+const T       = n => { const d=new Date(); d.setDate(d.getDate()+n); return d.toISOString().split("T")[0]; };
+
+function workDiff(a, b) {
+  const start = new Date(a < b ? a : b);
+  const end   = new Date(a < b ? b : a);
+  let count = 0;
+  const cur = new Date(start);
+  while (cur < end) {
+    const d = cur.getDay();
+    if (d !== 0 && d !== 6) count++;
+    cur.setDate(cur.getDate() + 1);
+  }
+  return a <= b ? count : -count;
+}
+
+const _fmt    = new Intl.DateTimeFormat("it-IT", { day:"2-digit", month:"short" });
+const fmtDate = d => _fmt.format(new Date(d));
+
+function computeHz(item) {
+  if (item.progress >= 100) return "done";
+  if (item.type === "inbox") return "inbox";
+  const base = baseHz(item.urgency, item.importance);
+  const dL   = item.end ? workDiff(today, item.end) : 999;
+  let dHz = base;
+  if (dL <= 0)        dHz = "today";
+  else if (dL <= 3)   dHz = maxHz(base, "today");
+  else if (dL <= 14)  dHz = maxHz(base, "week");
+  const risk = dL > 0 ? (100 - item.progress) / dL : 99;
+  let rHz = dHz;
+  if (risk > 20) rHz = maxHz(dHz, "today");
+  else if (risk > 8) rHz = maxHz(dHz, "week");
+  return maxHz(dHz, rHz);
+}
+
+function getRisk(item) {
+  if (item.progress >= 100 || !item.end) return null;
+  const dL = workDiff(today, item.end);
+  if (dL <= 0) return null;
+  const idx = (100 - item.progress) / dL;
+  const C = DARK; // colors resolved at call site when needed
+  if (idx > 20) return { level:"critical", colorKey:"red",    label:"Rischio alto", tip:`${Math.round(idx)} pt/g` };
+  if (idx > 8)  return { level:"warning",  colorKey:"orange", label:"Attenzione",   tip:`${Math.round(idx)} pt/g` };
+  return null;
+}
+
+function isEscalated(item) {
+  if (!item.urgency || !item.importance || !item.end) return false;
+  return RANK[computeHz(item)] > RANK[baseHz(item.urgency, item.importance)];
+}
+
+function computeSuggestions({ todayItems, inboxItems, projects, backlogItems, waitingItems, load, freeHours }) {
+  const out = [];
+  const isThursday = new Date().getDay() === 4;
+  if (load > freeHours)
+    out.push({ id:"overload", icon:"warning", text:`Oggi hai ~${Math.round(load)}h di lavoro stimato su ${freeHours}h disponibili. Considera di spostare qualcosa.` });
+  if (todayItems.length > 5)
+    out.push({ id:"today_overflow", icon:"warning", text:`${todayItems.length} priorità oggi. La working memory gestisce al meglio 3–4 unità. Valuta cosa posticipare.` });
+  if (inboxItems.length > 3)
+    out.push({ id:"inbox", icon:"inbox", text:`${inboxItems.length} task non classificati in inbox. 5 minuti di elaborazione riducono il carico cognitivo residuo.` });
+  const orphans = projects.filter(p => p.subtasks.length > 0 && !p.subtasks.find(s => s.next && !s.done));
+  if (orphans.length > 0)
+    out.push({ id:"orphan", icon:"layers", text:`${orphans.length} progett${orphans.length > 1 ? "i" : "o"} senza azione "Prossimo". Senza next action un progetto rimane bloccato nella mente.` });
+  if (backlogItems.length > 5)
+    out.push({ id:"backlog", icon:"archive", text:`${backlogItems.length} task in backlog. Ogni loop aperto consuma risorse cognitive. Parcheggia quello che non farai mai.` });
+  if (isThursday && waitingItems.length > 0)
+    out.push({ id:"waiting_review", icon:"pause", text:`È giovedì — hai ${waitingItems.length} task in attesa. Controlla se qualcuno si è mosso e aggiorna lo stato.` });
+  else if (!isThursday && waitingItems.length > 0) {
+    const stale = waitingItems.filter(t => t.waitingSince && workDiff(t.waitingSince, today) > 7);
+    if (stale.length > 0)
+      out.push({ id:"waiting_stale", icon:"pause", text:`${stale.length} task in attesa da oltre 7 giorni lavorativi. Giovedì è il momento per fare il punto.` });
+  }
+  return out;
+}
+
+const calcProg  = subs => subs.length ? Math.round(subs.filter(s => s.done).length / subs.length * 100) : 0;
+const EMPTY_TASK = { title:"", type:"action", color:PALETTE[4], urgency:null, importance:null, start:"", end:"", progress:0, duration:"quick", description:"", subtasks:[], attachments:[], waiting:false, waitingFor:"", waitingSince:"" };
+
+// ── Schema normalizer — merges saved data with current EMPTY_TASK defaults ──
+// Ensures tasks saved by older versions of the app get new fields filled in
+function normalizeTask(raw) {
+  return { ...EMPTY_TASK, ...raw,
+    subtasks:    (raw.subtasks    || []).map(s => ({ done:false, next:false, ...s })),
+    attachments: (raw.attachments || []),
+  };
+}
+
+// ── Shared style helpers ──
+const inp  = (C, ex={}) => ({ width:"100%", background:C.s2, border:"none", borderRadius:10, padding:"11px 14px", color:C.l1, fontSize:15, outline:"none", boxSizing:"border-box", colorScheme: C === LIGHT ? "light" : "dark", fontFamily:"inherit", ...ex });
+const slbl = C => ({ fontSize:13, color:C.l2, fontWeight:500, display:"block", marginBottom:6 });
+const btn  = (C, extra={}) => ({ border:"none", borderRadius:8, cursor:"pointer", fontFamily:"inherit", ...extra });
+const pill = (color, extra={}) => ({ fontSize:11, fontWeight:600, padding:"2px 7px", borderRadius:6, background:color+"22", color, display:"inline-flex", alignItems:"center", gap:3, ...extra });
+const card = (C, extra={}) => ({ background:C.s1, borderRadius:16, overflow:"hidden", boxShadow:C.shadow, ...extra });
+
+function Sheet({ onClose, children, width=480 }) {
+  const C = useContext(ThemeCtx);
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:100 }}>
+      <div onClick={e=>e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:24, width, maxWidth:"95vw", maxHeight:"92vh", overflowY:"auto", boxShadow:"0 24px 80px rgba(0,0,0,0.5)" }}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ── Icon — outline SVG icons, same register as sun/moon ──
+function Icon({ name, size=14, color="currentColor", style={} }) {
+  const props = { width:size, height:size, viewBox:"0 0 24 24", fill:"none", stroke:color, strokeWidth:1.75, strokeLinecap:"round", strokeLinejoin:"round", style };
+  switch (name) {
+    case "bolt":      return <svg {...props}><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>;
+    case "layers":    return <svg {...props}><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>;
+    case "clock":     return <svg {...props}><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>;
+    case "hourglass": return <svg {...props}><path d="M5 2h14"/><path d="M5 22h14"/><path d="M5 2a15 15 0 0 0 14 10A15 15 0 0 0 5 22"/><path d="M19 2a15 15 0 0 1-14 10A15 15 0 0 1 19 22"/></svg>;
+    case "pause":     return <svg {...props}><circle cx="12" cy="12" r="10"/><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>;
+    case "alert":     return <svg {...props}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>;
+    case "warning":   return <svg {...props}><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>;
+    case "inbox":     return <svg {...props}><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>;
+    case "archive":   return <svg {...props}><polyline points="21 8 21 21 3 21 3 8"/><rect x="1" y="3" width="22" height="5"/><line x1="10" y1="12" x2="14" y2="12"/></svg>;
+    case "dot-info":  return <svg {...props}><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>;
+    case "timer":     return <svg {...props}><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>;
+    case "blocks":    return <svg {...props}><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>;
+    case "repeat":    return <svg {...props}><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>;
+    default:          return <svg {...props}><circle cx="12" cy="12" r="2"/></svg>;
+  }
+}
+
+function TaskForm({ initial, onSave, onClose, isEdit=false }) {
+  const C   = useContext(ThemeCtx);
+  const lbl = slbl(C);
+  const [form, setForm] = useState(initial);
+  const [subIn, setSubIn] = useState("");
+  const set = (k,v) => setForm(f => ({ ...f, [k]:v }));
+  const ok  = form.title.trim() && (form.type === "inbox" || form.type === "action" || form.end);
+
+  const handleSave = () => {
+    if (!ok) return;
+    const hz = form.urgency && form.importance ? baseHz(form.urgency, form.importance) : "backlog";
+    onSave({ ...form, horizon:hz });
+  };
+
+  function addSubField() {
+    const l = subIn.trim();
+    if (!l) return;
+    set("subtasks", [...form.subtasks, { id:Date.now(), label:l, done:false }]);
+    setSubIn("");
+  }
+
+  const cell = form.urgency && form.importance ? getCell(form.urgency, form.importance) : null;
+
+  return (
+    <Sheet onClose={onClose} width={500}>
+
+      {/* Header */}
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20 }}>
+        <div style={{ fontSize:17, fontWeight:700, color:C.l1 }}>{isEdit ? "Modifica task" : "Nuovo task"}</div>
+        <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>✕</button>
+      </div>
+
+      {/* Title */}
+      <div style={{ marginBottom:16 }}>
+        <span style={lbl}>Titolo</span>
+        <input style={inp(C)} value={form.title} placeholder="Es. Preparare presentazione…" autoFocus onChange={e => set("title", e.target.value)} onKeyDown={e => e.key === "Enter" && handleSave()} />
+      </div>
+
+      {/* Matrix — urgency × importance */}
+      <div style={{ marginBottom:16 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+          <span style={lbl}>Priorità <span style={{ fontWeight:400, color:C.l3 }}>(urgenza × importanza)</span></span>
+          {form.type === "inbox" && (
+            <span style={{ fontSize:11, color:C.teal, fontWeight:500 }}>classificato come inbox</span>
+          )}
+        </div>
+        <div style={{ display:"flex", paddingLeft:44, marginBottom:4 }}>
+          {["Non urgente","Urgente"].map(l => (
+            <div key={l} style={{ flex:1, textAlign:"center", fontSize:9, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</div>
+          ))}
+        </div>
+        <div style={{ display:"flex", gap:5 }}>
+          <div style={{ display:"flex", flexDirection:"column", width:40, gap:4 }}>
+            {["Alta","Bassa"].map(l => (
+              <div key={l} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"flex-end", paddingRight:6, minHeight:64 }}>
+                <span style={{ fontSize:9, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</span>
+              </div>
+            ))}
+          </div>
+          <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 }}>
+            {MATRIX.map(c => {
+              var isSel = form.urgency === c.u && form.importance === c.i;
+              return (
+                <div key={c.u+""+c.i}
+                  onClick={() => setForm(f => ({ ...f, urgency:c.u, importance:c.i, type: f.type === "inbox" ? "action" : f.type }))}
+                  style={{ background:isSel ? c.color+"28" : C.s2, borderRadius:10, padding:"10px 12px", cursor:"pointer", border:"1.5px solid "+(isSel ? c.color : "transparent"), transition:"all 0.15s", minHeight:64, display:"flex", flexDirection:"column", justifyContent:"center", gap:2 }}
+                  onMouseEnter={function(e){ if (!isSel) e.currentTarget.style.background = C.s3; }}
+                  onMouseLeave={function(e){ if (!isSel) e.currentTarget.style.background = C.s2; }}>
+                  <div style={{ fontSize:12, fontWeight:700, color:isSel ? c.color : C.l1 }}>{c.label}</div>
+                  <div style={{ fontSize:10, color:C.l3, lineHeight:1.35 }}>{c.sub}</div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+        {/* Selected cell hint + inbox escape hatch */}
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:7 }}>
+          <div>
+            {cell && (
+              <span style={{ fontSize:11, color:cell.color, fontWeight:500 }}>
+                → agenda: {HZ[cell.hz] ? HZ[cell.hz].label : ""}
+              </span>
+            )}
+            {!cell && form.type !== "inbox" && (
+              <span style={{ fontSize:11, color:C.l3 }}>Seleziona un quadrante per classificare</span>
+            )}
+          </div>
+          <button
+            onClick={() => setForm(f => ({ ...f, type:"inbox", urgency:null, importance:null }))}
+            style={{ background:"none", border:"none", fontSize:11, color:form.type === "inbox" ? C.teal : C.l3, cursor:"pointer", padding:0, fontFamily:"inherit", fontWeight: form.type === "inbox" ? 600 : 400 }}>
+            {form.type === "inbox" ? "✓ Classifica dopo" : "Classifica dopo →"}
+          </button>
+        </div>
+      </div>
+
+      {form.type !== "inbox" && (
+        <>
+          {/* Type */}
+          <div style={{ marginBottom:14 }}>
+            <span style={lbl}>Tipo</span>
+            <div style={{ display:"flex", gap:6 }}>
+              {[["action","bolt","Azione","Una sessione"],["project","layers","Progetto","Più sessioni"]].map(function(arr) {
+                var t=arr[0], ic=arr[1], l=arr[2], d=arr[3];
+                return (
+                  <div key={t} onClick={() => set("type", t)} style={{ flex:1, padding:"10px 12px", borderRadius:12, background:form.type === t ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.type === t ? C.blue : "transparent"), cursor:"pointer", transition:"all 0.15s" }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:2, color:form.type === t ? C.blue : C.l1 }}>
+                      <Icon name={ic} size={13} color="currentColor"/>
+                      <span style={{ fontSize:13, fontWeight:600 }}>{l}</span>
+                    </div>
+                    <div style={{ fontSize:11, color:C.l3 }}>{d}</div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Duration */}
+          {form.type === "action" && (
+            <div style={{ marginBottom:14 }}>
+              <span style={lbl}>Impegno stimato</span>
+              <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                {DURATIONS.filter(function(d){ return ACTION_DURATIONS.indexOf(d.id) >= 0; }).map(d => (
+                  <div key={d.id} onClick={() => set("duration", d.id)} style={{ flex:1, padding:"9px 10px", borderRadius:10, background:form.duration === d.id ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.duration === d.id ? C.blue : "transparent"), cursor:"pointer", textAlign:"center", transition:"all 0.15s" }}>
+                    <div style={{ display:"flex", justifyContent:"center", marginBottom:4, color:form.duration === d.id ? C.blue : C.l3 }}><Icon name={d.icon} size={14} color="currentColor" /></div>
+                    <div style={{ fontSize:11, fontWeight:600, color:form.duration === d.id ? C.blue : C.l1 }}>{d.label}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Dates */}
+          {form.type === "action" ? (
+            <div style={{ marginBottom:14 }}>
+              <span style={lbl}>Scadenza <span style={{ color:C.l3, fontWeight:400 }}>(opzionale — alimenta l'urgenza automatica)</span></span>
+              <input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} />
+            </div>
+          ) : (
+            <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+              <div><span style={lbl}>Inizio</span><input type="date" style={inp(C)} value={form.start} onChange={e => set("start", e.target.value)} /></div>
+              <div><span style={lbl}>Scadenza</span><input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} /></div>
+            </div>
+          )}
+
+          {/* Color */}
+          <div style={{ marginBottom:14 }}>
+            <span style={lbl}>Colore identità</span>
+            <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+              {PALETTE.slice(0, 7).map(c => (
+                <div key={c} onClick={() => set("color", c)} style={{ width:22, height:22, borderRadius:"50%", background:c, cursor:"pointer", flexShrink:0, boxShadow:form.color === c ? `0 0 0 3px ${C.bg},0 0 0 5px ${c}` : "none", transition:"box-shadow 0.2s" }} />
+              ))}
+              <label title="Colore personalizzato" style={{ width:22, height:22, borderRadius:"50%", background:PALETTE.indexOf(form.color) === -1 ? form.color : C.s3, cursor:"pointer", flexShrink:0, boxShadow:PALETTE.indexOf(form.color) === -1 ? `0 0 0 3px ${C.bg},0 0 0 5px ${form.color}` : "none", transition:"box-shadow 0.2s", display:"flex", alignItems:"center", justifyContent:"center", overflow:"hidden", border:"1.5px dashed "+C.l3 }}>
+                <input type="color" value={form.color} onChange={e => set("color", e.target.value)} style={{ opacity:0, position:"absolute", width:1, height:1, pointerEvents:"none" }} />
+                {PALETTE.indexOf(form.color) !== -1 && <span style={{ fontSize:13, color:C.l3, lineHeight:1 }}>+</span>}
+              </label>
+            </div>
+          </div>
+
+          {/* Subtasks (projects only) */}
+          {form.type === "project" && (
+            <div style={{ marginBottom:14 }}>
+              <span style={lbl}>Sotto-attività ({form.subtasks.length})</span>
+              <div style={{ display:"flex", gap:8, marginBottom:8 }}>
+                <input style={inp(C,{ flex:1 })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSubField()} />
+                <button onClick={addSubField} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, width:42, cursor:"pointer", fontSize:20, fontWeight:300, flexShrink:0 }}>+</button>
+              </div>
+              {form.subtasks.length > 0 && (
+                <div style={{ background:C.s2, borderRadius:12, overflow:"hidden" }}>
+                  {form.subtasks.map(function(s, idx) {
+                    return (
+                      <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"10px 14px", borderBottom:idx < form.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:10 }}>
+                        <span style={{ flex:1, fontSize:14, color:C.l1 }}>{s.label}</span>
+                        <button onClick={() => set("subtasks", form.subtasks.filter(function(x){ return x.id !== s.id; }))} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, opacity:0.7, padding:0 }}>−</button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Notes */}
+          <div style={{ marginBottom:14 }}>
+            <span style={lbl}>Note</span>
+            <input style={inp(C)} value={form.description} placeholder="Contesto, link, riferimenti…" onChange={e => set("description", e.target.value)} />
+          </div>
+
+          {/* Waiting */}
+          <div style={{ marginBottom:18, background:form.waiting ? `${C.teal}12` : C.s2, borderRadius:12, padding:"12px 14px", border:"1.5px solid "+(form.waiting ? `${C.teal}50` : "transparent"), transition:"all 0.2s" }}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:form.waiting ? 10 : 0 }}>
+              <div>
+                <div style={{ display:"flex", alignItems:"center", gap:6, color:form.waiting ? C.teal : C.l1 }}>
+                  <Icon name="pause" size={13} color="currentColor"/>
+                  <div style={{ fontSize:13, fontWeight:600 }}>In attesa di qualcuno</div>
+                </div>
+                <div style={{ fontSize:11, color:C.l3, marginTop:2 }}>Non dipende da te — tocca ad altri muoversi</div>
+              </div>
+              <div onClick={() => setForm(f => ({ ...f, waiting:!f.waiting, waitingSince:!f.waiting ? today : "" }))}
+                style={{ width:40, height:24, borderRadius:12, background:form.waiting ? C.teal : C.s3, cursor:"pointer", position:"relative", transition:"background 0.2s", flexShrink:0 }}>
+                <div style={{ width:18, height:18, borderRadius:"50%", background:"#fff", position:"absolute", top:3, left:form.waiting ? 19 : 3, transition:"left 0.2s", boxShadow:"0 1px 3px rgba(0,0,0,0.3)" }} />
+              </div>
+            </div>
+            {form.waiting && (
+              <input style={inp(C, { fontSize:13, padding:"9px 12px" })} value={form.waitingFor} placeholder="Chi? Es. Marco, Studio legale, Cliente X…" onChange={e => set("waitingFor", e.target.value)} />
+            )}
+          </div>
+        </>
+      )}
+
+      {/* Save */}
+      <button onClick={handleSave} style={{ width:"100%", padding:"13px", borderRadius:12, border:"none", background:ok ? C.blue : C.s3, color:ok ? "#fff" : C.l3, cursor:ok ? "pointer" : "default", fontSize:15, fontWeight:600, transition:"all 0.2s" }}>
+        {isEdit ? "Salva modifiche" : "Aggiungi task"}
+      </button>
+
+    </Sheet>
+  );
+}
+
+function SuggestionWhisper({ suggestions }) {
+  const C = useContext(ThemeCtx);
+  const [idx, setIdx] = useState(0);
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem("tm_v1_whisper_dismissed") === today; } catch { return false; }
+  });
+
+  function dismiss() {
+    try { localStorage.setItem("tm_v1_whisper_dismissed", today); } catch {}
+    setDismissed(true);
+  }
+
+  if (!suggestions.length || dismissed) return null;
+  const s = suggestions[Math.min(idx, suggestions.length-1)];
+  return (
+    <div style={{ background:C.s1, borderRadius:12, padding:"11px 14px", marginBottom:16, display:"flex", alignItems:"center", gap:12, border:`1px solid ${C.sep}` }}>
+      <span style={{ display:"flex", alignItems:"center", flexShrink:0, color: s.icon === "warning" ? C.orange : C.l3 }}><Icon name={s.icon} size={14} color="currentColor"/></span>
+      <span style={{ flex:1, fontSize:13, color:C.l2, lineHeight:1.45 }}>{s.text}</span>
+      <div style={{ display:"flex", gap:4, alignItems:"center", flexShrink:0 }}>
+        {suggestions.length > 1 && (
+          <>
+            <button onClick={() => setIdx(i => (i-1+suggestions.length)%suggestions.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>‹</button>
+            <span style={{ fontSize:11, color:C.l3 }}>{idx+1}/{suggestions.length}</span>
+            <button onClick={() => setIdx(i => (i+1)%suggestions.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>›</button>
+          </>
+        )}
+        <button onClick={dismiss} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:14, padding:"2px 8px", marginLeft:4 }}>✕</button>
+      </div>
+    </div>
+  );
+}
+
+function QuickCapture({ onAdd }) {
+  const C = useContext(ThemeCtx);
+  const [val, setVal]       = useState("");
+  const [active, setActive] = useState(false);
+  const [flash, setFlash]   = useState(false);
+
+  function submit() {
+    const t = val.trim();
+    if (!t) return;
+    onAdd(t);
+    setVal("");
+    setActive(false);
+    setFlash(true);
+    setTimeout(() => setFlash(false), 600);
+  }
+
+  return (
+    <div style={{ marginBottom:20 }}>
+      <div style={{ display:"flex", gap:10, alignItems:"center", background:flash ? `${C.green}18` : active ? C.s2 : C.s1, borderRadius:12, padding:"11px 16px", border:`1px solid ${flash ? `${C.green}60` : active ? `${C.blue}50` : C.sep}`, transition:"all 0.3s" }}>
+        <span style={{ fontSize:20, color:flash ? C.green : active ? C.blue : C.l3, transition:"color 0.3s", flexShrink:0 }}>{flash ? "✓" : "+"}</span>
+        <input
+          value={val} onChange={e => setVal(e.target.value)}
+          onKeyDown={e => { if (e.key === "Enter") submit(); if (e.key === "Escape") { setVal(""); setActive(false); } }}
+          onFocus={() => setActive(true)}
+          onBlur={() => setActive(false)}
+          placeholder="Cattura un pensiero…"
+          style={{ flex:1, background:"none", border:"none", outline:"none", color:C.l1, fontSize:15, fontFamily:"inherit" }}
+        />
+        {val && (
+          <>
+            <button onClick={() => { setVal(""); setActive(false); }}
+              style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:14, padding:"0 2px", flexShrink:0, lineHeight:1 }}>✕</button>
+            <button onClick={submit} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:8, padding:"4px 12px", cursor:"pointer", fontSize:13, fontWeight:600, flexShrink:0 }}>↵</button>
+          </>
+        )}
+      </div>
+      {active && <div style={{ fontSize:11, color:C.l3, marginTop:5, paddingLeft:4 }}>↵ per catturare · Esc per annullare · Classifica dopo in Inbox</div>}
+    </div>
+  );
+}
+
+function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor }) {
+  const C       = useContext(ThemeCtx);
+  const dL      = task.end ? workDiff(today, task.end) : null;
+  const doneSubs = task.subtasks.filter(s => s.done).length;
+  const nextSub  = task.subtasks.find(s => s.next && !s.done);
+  const riskRaw  = getRisk(task);
+  const risk     = riskRaw ? { ...riskRaw, color: C[riskRaw.colorKey] } : null;
+  const escalated = isEscalated(task);
+  const dur      = DURATION_MAP[task.duration];
+  const isInbox  = task.type === "inbox";
+
+  return (
+    <div>
+      <div className="agenda-row" onClick={onSelect}
+        style={{ display:"flex", alignItems:"stretch", cursor:"pointer", background:isSelected ? C.s2 : "transparent", transition:"background 0.12s" }}>
+        <div style={{ width:4, background:isInbox ? C.l3 : hzColor, flexShrink:0, borderRadius:"4px 0 0 4px", opacity:isInbox ? 0.2 : 1 }} />
+        <div style={{ flex:1, display:"flex", alignItems:"center", padding:"10px 14px 10px 13px", gap:10 }}>
+
+          {/* Completion circle */}
+          <div onClick={e => { e.stopPropagation(); onComplete(task.id); }}
+            title="Segna come completato"
+            style={{ width:18, height:18, borderRadius:"50%", flexShrink:0, border:`1.5px solid ${isInbox ? C.l3 : hzColor}`, background:"transparent", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity: isInbox ? 0.3 : 0.45, transition:"all 0.15s" }}
+            onMouseEnter={e => { e.currentTarget.style.opacity="1"; e.currentTarget.style.background=hzColor+"30"; }}
+            onMouseLeave={e => { e.currentTarget.style.opacity= isInbox ? "0.3" : "0.45"; e.currentTarget.style.background="transparent"; }}>
+            <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke={isInbox ? C.l3 : hzColor} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>
+          </div>
+
+          {/* Identity dot */}
+          <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
+
+          <div style={{ flex:1, minWidth:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom: task.description ? 2 : 3, flexWrap:"wrap" }}>
+              <span style={{ fontSize:15, fontWeight:600, color:isInbox ? C.l2 : task.waiting ? C.l2 : C.l1 }}>{task.title}</span>
+              {isInbox && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>}
+              {task.waiting && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.teal}22`, color:C.teal, display:"inline-flex", alignItems:"center", gap:3 }}><Icon name="pause" size={9} color="currentColor"/>in attesa</span>}
+              {escalated && !isInbox && !task.waiting && (
+                <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:(risk && risk.level==="critical") ? `${C.red}2A` : `${C.orange}2A`, color:(risk && risk.level==="critical") ? C.red : C.orange, display:"inline-flex", alignItems:"center", gap:3 }}>
+                  <Icon name="warning" size={9} color="currentColor"/>
+                  {(risk && risk.level==="critical") ? "rischio" : "in scadenza"}
+                </span>
+              )}
+            </div>
+            {task.description && (
+              <div style={{ fontSize:12, color:C.l3, marginBottom:3, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", width:0, minWidth:"100%" }}>{task.description}</div>
+            )}
+            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+              {dur && !isInbox && <span style={{ display:"flex", alignItems:"center", color:C.l3 }}><Icon name={dur.icon} size={11} color="currentColor" /></span>}
+              {task.subtasks.length > 0 && <span style={{ fontSize:12, color:C.l3 }}>{doneSubs}/{task.subtasks.length} sottotask</span>}
+              {task.attachments && task.attachments.length > 0 && (
+                <span style={{ display:"flex", alignItems:"center", gap:3, fontSize:11, color:C.l3 }}>
+                  <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                  </svg>
+                  {task.attachments.length}
+                </span>
+              )}
+              {dL !== null && dL < 0 && <span style={{ fontSize:11, color:C.red, opacity:0.45 }}>· in ritardo di {Math.abs(dL)}g</span>}
+              {risk && !isInbox && <span style={{ fontSize:11, color:risk.color }}>{risk.tip}</span>}
+            </div>
+          </div>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3, flexShrink:0 }}>
+            {!isInbox && <span style={{ fontSize:13, fontWeight:600, color:task.color }}>{task.progress}%</span>}
+            {dL !== null && <span style={{ fontSize:11, color:dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
+              {dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : dL === 1 ? "Dom." : `${dL}gg lav.`}
+            </span>}
+          </div>
+          {!isInbox && (
+            <div style={{ width:3, height:34, background:C.s3, borderRadius:3, overflow:"hidden", flexShrink:0 }}>
+              <div style={{ width:"100%", height:`${task.progress}%`, background:task.color, borderRadius:3, transition:"height 0.3s", marginTop:`${100-task.progress}%` }} />
+            </div>
+          )}
+        </div>
+      </div>
+      {nextSub && (
+        <div onClick={onSelect} style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 14px 8px 36px", cursor:"pointer", background:isSelected ? C.s2 : "transparent" }}>
+          <div style={{ width:3, background:hzColor, alignSelf:"stretch", borderRadius:3, flexShrink:0 }} />
+          <div style={{ width:12, height:12, borderRadius:"50%", border:`1.5px solid ${task.color}`, flexShrink:0 }} />
+          <span style={{ fontSize:13, color:C.l2, flex:1 }}>{nextSub.label}</span>
+          <span style={{ fontSize:10, fontWeight:600, padding:"2px 7px", borderRadius:7, background:task.color+"22", color:task.color }}>→ Prossimo</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AgendaSection({ items, selected, onSelect, onComplete, label, color, extra }) {
+  const C = useContext(ThemeCtx);
+  const [collapsed, setCollapsed] = useState(false);
+  if (!items.length) return null;
+  return (
+    <div onClick={e => e.stopPropagation()} style={{ marginBottom:24 }}>
+      <div onClick={() => setCollapsed(c => !c)} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10, cursor:"pointer", userSelect:"none" }}>
+        <div style={{ width:5, height:5, borderRadius:"50%", background:color }} />
+        <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:1.1 }}>{label.toUpperCase()}</span>
+        <span style={{ fontSize:12, color:C.l3, fontWeight:500 }}>{items.length}</span>
+        {extra && <span style={{ marginLeft:"auto", fontSize:11, color:extra.color, fontWeight:500 }}>{extra.text}</span>}
+        <span style={{ marginLeft:extra ? 0 : "auto", color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.2s", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
+          <svg width="12" height="7" viewBox="0 0 12 7" fill="none"><path d="M1 1L6 6L11 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        </span>
+      </div>
+      {!collapsed && (
+        <div style={card(C)}>
+          {items.map((task, idx) => (
+            <div key={task.id} style={{ borderBottom:idx < items.length-1 ? `1px solid ${C.sep}` : "none" }}>
+              <AgendaRow task={task} isSelected={selected === task.id} onSelect={() => onSelect(task.id)} onComplete={onComplete} hzColor={color} />
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function AttachmentViewer({ attachment, onClose }) {
+  const C = useContext(ThemeCtx);
+  const [url, setUrl] = useState(null);
+
+  useEffect(() => {
+    idbGet(attachment.id).then(rec => {
+      if (rec) setUrl(URL.createObjectURL(rec.blob));
+    });
+    return () => { if (url) URL.revokeObjectURL(url); };
+  }, [attachment.id]);
+
+  const isImage = attachment.type.startsWith("image/");
+  const isPDF   = attachment.type === "application/pdf";
+
+  return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", backdropFilter:"blur(24px)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:500 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width:"90vw", maxWidth:900, height:"85vh", display:"flex", flexDirection:"column", gap:10 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
+          <span style={{ fontSize:13, fontWeight:600, color:"rgba(255,255,255,0.8)" }}>{attachment.name}</span>
+          <div style={{ display:"flex", gap:8 }}>
+            {url && (
+              <a href={url} download={attachment.name}
+                style={{ fontSize:12, color:"rgba(255,255,255,0.5)", background:"rgba(255,255,255,0.1)", borderRadius:8, padding:"5px 12px", textDecoration:"none", fontWeight:500 }}>
+                Scarica
+              </a>
+            )}
+            <button onClick={onClose} style={{ background:"rgba(255,255,255,0.12)", border:"none", color:"#fff", borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+          </div>
+        </div>
+        <div style={{ flex:1, borderRadius:14, overflow:"hidden", background:"rgba(255,255,255,0.05)", display:"flex", alignItems:"center", justifyContent:"center" }}>
+          {!url ? (
+            <span style={{ color:"rgba(255,255,255,0.3)", fontSize:13 }}>Caricamento…</span>
+          ) : isImage ? (
+            <img src={url} alt={attachment.name} style={{ maxWidth:"100%", maxHeight:"100%", objectFit:"contain", borderRadius:8 }} />
+          ) : isPDF ? (
+            <iframe src={url} title={attachment.name} style={{ width:"100%", height:"100%", border:"none", borderRadius:8 }} />
+          ) : (
+            <div style={{ textAlign:"center", color:"rgba(255,255,255,0.4)" }}>
+              <div style={{ fontSize:36, marginBottom:12 }}><Icon name="archive" size={36} color="currentColor"/></div>
+              <div style={{ fontSize:13 }}>Anteprima non disponibile</div>
+              <a href={url} download={attachment.name} style={{ fontSize:12, color:"#0A84FF", marginTop:8, display:"block" }}>Scarica il file</a>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function AttachmentSection({ task, onAdd, onRemove }) {
+  const C        = useContext(ThemeCtx);
+  const fileRef  = useRef(null);
+  const [viewing, setViewing]   = useState(null);
+  const [loading, setLoading]   = useState(false);
+
+  const fmtSize = bytes => bytes < 1024*1024
+    ? `${(bytes/1024).toFixed(0)} KB`
+    : `${(bytes/1024/1024).toFixed(1)} MB`;
+
+  function handleFiles(e) {
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+    setLoading(true);
+    let chain = Promise.resolve();
+    files.forEach(file => {
+      chain = chain.then(() => {
+        const id   = `att_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+        const meta = { id, name:file.name, type:file.type, size:file.size, createdAt:new Date().toISOString() };
+        return idbSave({ id, blob:file }).then(() => { onAdd(task.id, meta); });
+      });
+    });
+    chain.then(() => { setLoading(false); e.target.value = ""; });
+  }
+
+  function handleRemove(att) {
+    onRemove(task.id, att);
+  }
+
+  const iconFor = type => type.startsWith("image/") ? "blocks" : type === "application/pdf" ? "archive" : "dot-info";
+
+  return (
+    <div style={{ marginBottom:12 }}>
+      <input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt" style={{ display:"none" }} onChange={handleFiles} />
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:7 }}>
+        <span style={{ fontSize:12, fontWeight:500, color:C.l2 }}>Allegati</span>
+        <button onClick={() => fileRef.current.click()}
+          style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"3px 10px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
+          {loading ? "…" : <><Icon name="inbox" size={10} color="currentColor"/> Allega</>}
+        </button>
+      </div>
+      {task.attachments.length > 0 && (
+        <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+          {task.attachments.map(att => (
+            <div key={att.id} style={{ display:"flex", alignItems:"center", gap:8, background:C.s2, borderRadius:9, padding:"7px 10px" }}>
+              <span style={{ color:C.l3, flexShrink:0 }}><Icon name={iconFor(att.type)} size={12} color="currentColor"/></span>
+              <button onClick={() => setViewing(att)}
+                style={{ flex:1, background:"none", border:"none", textAlign:"left", cursor:"pointer", padding:0, minWidth:0 }}>
+                <div style={{ fontSize:12, fontWeight:500, color:C.l1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{att.name}</div>
+                <div style={{ fontSize:10, color:C.l3 }}>{fmtSize(att.size)}</div>
+              </button>
+                <button onClick={() => handleRemove(att)}
+                  style={{ background:"none", border:"none", color:C.red, cursor:"pointer", opacity:0.4, padding:"2px 4px", flexShrink:0, fontSize:14, lineHeight:1, fontFamily:"inherit" }}
+                  onMouseEnter={e => e.currentTarget.style.opacity="1"}
+                  onMouseLeave={e => e.currentTarget.style.opacity="0.4"}>
+                  ✕
+                </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {task.attachments.length === 0 && (
+        <div style={{ fontSize:11, color:C.l3, textAlign:"center", padding:"10px 0" }}>Nessun allegato</div>
+      )}
+      {viewing && <AttachmentViewer attachment={viewing} onClose={() => setViewing(null)} />}
+    </div>
+  );
+}
+
+function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete, onToggleSub, onAddSub, onDelSub, onSetNext, onUpdateProg, onToggleWaiting, onAddAttachment, onRemoveAttachment }) {
+  const C      = useContext(ThemeCtx);
+  const lbl    = slbl(C);
+  const [subIn, setSubIn] = useState("");
+  const dL     = task.end ? workDiff(today, task.end) : null;
+  const doneSubs = task.subtasks.filter(s => s.done).length;
+  const riskRaw = getRisk(task);
+  const risk    = riskRaw ? { ...riskRaw, color: C[riskRaw.colorKey] } : null;
+  const esc     = isEscalated(task);
+  const compHz  = computeHz(task);
+  const cell    = task.urgency && task.importance ? getCell(task.urgency, task.importance) : null;
+  const dur     = DURATION_MAP[task.duration];
+
+  function addSubPanel() {
+    const l = subIn.trim();
+    if (!l) return;
+    onAddSub(task.id, l);
+    setSubIn("");
+  }
+
+  return (
+    <div style={{ width:300, background:C.s1, borderLeft:`1px solid ${C.sep}`, overflowY:"auto", padding:"20px 18px", animation:"panelIn 0.2s ease", flexShrink:0, display:"flex", flexDirection:"column", boxShadow:C.shadow ? `-4px 0 20px rgba(0,0,0,0.08)` : "none" }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+          <div style={{ width:8, height:8, borderRadius:"50%", background:task.color }} />
+          {dur && <span style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.l3 }}><Icon name={dur.icon} size={11} color="currentColor"/>{dur.label}</span>}
+        </div>
+        <div style={{ display:"flex", gap:5 }}>
+          {task.type !== "inbox" && !task.waiting && (
+            <button onClick={() => onToggleWaiting(task.id)} title="Metti in attesa" style={{ background:C.s2, border:"none", color:C.l3, borderRadius:8, padding:"5px 8px", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>
+            </button>
+          )}
+          <button onClick={onEdit} style={{ background:task.type==="inbox" ? `${C.blue}22` : C.s2, border:"none", color:task.type==="inbox" ? C.blue : C.l2, borderRadius:8, padding:"5px 10px", cursor:"pointer", fontSize:12, fontWeight:task.type==="inbox" ? 600 : 500 }}>{task.type === "inbox" ? "Classifica →" : "Modifica"}</button>
+          <button onClick={onClose} style={{ background:C.s2, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+        </div>
+      </div>
+
+      <h2 style={{ margin:"0 0 4px", fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3, lineHeight:1.25 }}>{task.title}</h2>
+      {task.description && (
+        <div style={{ background:C.s2, borderRadius:10, padding:"10px 12px", marginBottom:12, maxHeight:140, overflowY:"auto" }}>
+          <p style={{ margin:0, fontSize:13, color:C.l2, lineHeight:1.6, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>{task.description}</p>
+        </div>
+      )}
+
+      {task.waiting && (
+        <div style={{ background:`${C.teal}12`, borderRadius:12, padding:"11px 14px", marginBottom:12, border:`1px solid ${C.teal}30` }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:700, color:C.teal, marginBottom:3 }}><Icon name="pause" size={11} color="currentColor"/>In attesa</div>
+              {task.waitingFor && <div style={{ fontSize:12, color:C.l2 }}>↳ {task.waitingFor}</div>}
+              {task.waitingSince && <div style={{ fontSize:11, color:C.l3, marginTop:3 }}>da {workDiff(task.waitingSince, today)} gg lav.</div>}
+            </div>
+            <button onClick={() => onToggleWaiting(task.id)} style={{ fontSize:11, fontWeight:600, color:C.teal, background:`${C.teal}18`, border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer" }}>Sbloccato →</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
+        {HZ[compHz] && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:hzColor(compHz,C)+"2A", color:hzColor(compHz,C) }}>{HZ[compHz].label}</span>}
+        {cell && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:cell.color+"2A", color:cell.color }}>{cell.label}</span>}
+        {esc && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:`${C.orange}2A`, color:C.orange }}>Escalato</span>}
+      </div>
+
+      {(risk || esc) && (
+        <div style={{ background:((risk && risk.color) ? risk.color : C.orange)+"12", borderRadius:10, padding:"10px 12px", marginBottom:12, border:`1px solid ${((risk && risk.color) ? risk.color : C.orange)}25` }}>
+          {risk && (
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:esc ? 4 : 0 }}>
+              <span style={{ fontSize:12, fontWeight:600, color:risk.color }}>{risk.label}</span>
+              <span style={{ fontSize:11, color:C.l3 }}>{risk.tip}</span>
+            </div>
+          )}
+          {esc && cell && (
+            <div style={{ fontSize:11, color:C.l3 }}>
+              {(HZ[cell.hz] ? HZ[cell.hz].label : "")} → <span style={{ color:hzColor(compHz,C), fontWeight:600 }}>{HZ[compHz] ? HZ[compHz].label : ""}</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {task.end && (
+        <div style={{ background:C.s2, borderRadius:10, overflow:"hidden", marginBottom:12 }}>
+          {[["Scadenza", fmtDate(task.end)], ["Giorni lav. rimasti", dL !== null ? (dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : `${dL} gg lav.`) : "—"]].map(([l,v],i,arr) => (
+            <div key={l} style={{ display:"flex", justifyContent:"space-between", padding:"8px 12px", borderBottom:i < arr.length-1 ? `1px solid ${C.sep}` : "none" }}>
+              <span style={{ fontSize:12, color:C.l3 }}>{l}</span>
+              <span style={{ fontSize:12, fontWeight:500, color:dL !== null && dL < 0 && i === arr.length-1 ? C.red : C.l1 }}>{v}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <div style={{ marginBottom:12 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+          <span style={{ fontSize:12, color:C.l2, fontWeight:500 }}>Avanzamento</span>
+          <span style={{ fontSize:12, fontWeight:600, color:task.color }}>{task.progress}%</span>
+        </div>
+        {task.subtasks.length === 0 ? (
+          <div style={{ position:"relative", height:10, borderRadius:5, background:C.s3, overflow:"hidden", cursor:"pointer" }}
+            onClick={e => {
+              const rect = e.currentTarget.getBoundingClientRect();
+              const pct  = Math.round((e.clientX - rect.left) / rect.width * 100);
+              onUpdateProg(task.id, Math.min(100, Math.max(0, pct)));
+            }}>
+            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.15s" }} />
+          </div>
+        ) : (
+          <>
+            <div style={{ background:C.s3, borderRadius:5, height:6, overflow:"hidden" }}>
+              <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
+            </div>
+            <div style={{ fontSize:11, color:C.l3, textAlign:"center", marginTop:4 }}>Calcolato dai sottotask</div>
+          </>
+        )}
+      </div>
+
+      <div style={{ marginBottom:12 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:7 }}>
+          <span style={{ fontSize:12, fontWeight:500, color:C.l2 }}>Sotto-attività</span>
+          <span style={{ fontSize:11, color:C.l3 }}>{doneSubs}/{task.subtasks.length}</span>
+        </div>
+        {task.subtasks.length > 0 && (
+          <div style={{ background:C.s2, borderRadius:10, overflow:"hidden", marginBottom:7 }}>
+            {task.subtasks.map((s, idx) => (
+              <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"8px 11px", borderBottom:idx < task.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:8 }}>
+                <div onClick={() => onToggleSub(task.id, s.id)}
+                  style={{ width:15, height:15, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", transition:"all 0.2s" }}>
+                  {s.done && <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>}
+                </div>
+                <span onClick={() => onToggleSub(task.id, s.id)} style={{ flex:1, fontSize:13, color:s.done ? C.l3 : C.l1, textDecoration:s.done ? "line-through" : "none", cursor:"pointer" }}>{s.label}</span>
+                {!s.done && (
+                  <button onClick={() => onSetNext(task.id, s.id)}
+                    style={{ background:s.next ? task.color+"22" : "none", border:`1px solid ${s.next ? task.color : C.s3}`, color:s.next ? task.color : C.l3, borderRadius:5, padding:"1px 6px", cursor:"pointer", fontSize:9, fontWeight:700, flexShrink:0 }}>
+                    {s.next ? "→ next" : "→"}
+                  </button>
+                )}
+                {task.type === "project" && (
+                  <button onClick={() => onDelSub(task.id, s.id)}
+                    style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:15, padding:0, opacity:0, transition:"opacity 0.15s" }}
+                    onMouseEnter={e => e.currentTarget.style.opacity = "0.7"}
+                    onMouseLeave={e => e.currentTarget.style.opacity = "0"}>−</button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {task.type === "project" && (
+          <div style={{ display:"flex", gap:6 }}>
+            <input style={inp(C,{ flex:1, fontSize:13, padding:"8px 11px" })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSub()} />
+            <button onClick={addSubPanel} style={{ background:C.s2, border:"none", color:C.blue, borderRadius:9, width:34, cursor:"pointer", fontSize:18, flexShrink:0 }}>+</button>
+          </div>
+        )}
+      </div>
+
+      <AttachmentSection task={task} onAdd={onAddAttachment} onRemove={onRemoveAttachment} />
+
+      <div style={{ marginTop:"auto", paddingTop:8, display:"flex", flexDirection:"column", gap:6 }}>
+        {task.progress < 100 ? (
+          <button onClick={() => onComplete(task.id)} style={{ width:"100%", padding:"10px", borderRadius:10, border:"none", background:`${C.green}18`, color:C.green, cursor:"pointer", fontSize:13, fontWeight:600 }}>✓ Segna come completato</button>
+        ) : (
+          <button onClick={() => onUncomplete(task.id)} style={{ width:"100%", padding:"10px", borderRadius:10, border:"none", background:C.s2, color:C.l2, cursor:"pointer", fontSize:13, fontWeight:500 }}>↩ Riapri task</button>
+        )}
+        <button onClick={() => onDelete(task.id)} style={{ width:"100%", padding:"10px", borderRadius:10, border:"none", background:"rgba(255,69,58,0.08)", color:C.red, cursor:"pointer", fontSize:13, fontWeight:500 }}>Elimina</button>
+      </div>
+    </div>
+  );
+}
+
+function EndOfDayReview({ tasks, onClose, onDecide, onClassifyInbox }) {
+  const C = useContext(ThemeCtx);
+  const [decisions, setDecisions]       = useState({});  // task decisions
+  const [inboxDec, setInboxDec]         = useState({});  // inbox decisions
+  const [customDate, setCustomDate]     = useState({});
+  const [classifying, setClassifying]   = useState(null); // inbox task being classified
+  const [committed, setCommitted]       = useState(false);
+
+  // Section 1 — task aperti oggi o scaduti
+  const reviewItems = tasks.filter(t =>
+    t.progress < 100 && !t.waiting && t.type !== "inbox" &&
+    (computeHz(t) === "today" || (t.end && workDiff(today, t.end) < 0))
+  );
+
+  // Section 2 — inbox non elaborata
+  const inboxItems = tasks.filter(t => t.type === "inbox" && t.progress < 100);
+
+  const decidedTasks  = Object.keys(decisions).length;
+  const decidedInbox  = Object.keys(inboxDec).length;
+  const total         = reviewItems.length + inboxItems.length;
+  const decided       = decidedTasks + decidedInbox;
+  const allDone       = total > 0 && decided === total;
+  const pct           = total ? Math.round(decided / total * 100) : 100;
+
+  const decide      = (tid, choice) => setDecisions(d => ({ ...d, [tid]: choice }));
+  const decideInbox = (tid, choice) => setInboxDec(d => ({ ...d, [tid]: choice }));
+
+  // Called when user classifies an inbox task from within the review
+  function handleInboxClassified(form) {
+    onClassifyInbox(form);                       // update task in App state
+    decideInbox(form.id, "classified");          // mark as decided in review
+    setClassifying(null);
+  }
+
+  function commit() {
+    // Apply task decisions
+    reviewItems.forEach(t => {
+      const d = decisions[t.id];
+      if (!d) return;
+      if (d === "done")                onDecide(t.id, "done",     null);
+      else if (d === "tomorrow")       onDecide(t.id, "postpone", T(1));
+      else if (d.startsWith("date:"))  onDecide(t.id, "postpone", d.replace("date:", ""));
+      // "drop" → leave as-is, no call needed
+    });
+    setCommitted(true);
+    setTimeout(onClose, 1800);
+  }
+
+  const now = new Date().toLocaleTimeString("it-IT", { hour:"2-digit", minute:"2-digit" });
+
+  // ── Closing animation ──
+  if (committed) return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div style={{ textAlign:"center", color:"#fff" }}>
+        <div style={{ fontSize:52, marginBottom:16 }}>✦</div>
+        <div style={{ fontSize:22, fontWeight:700, letterSpacing:-0.5 }}>Giornata chiusa.</div>
+        <div style={{ fontSize:14, color:"rgba(255,255,255,0.5)", marginTop:8 }}>La mente è libera. A domani.</div>
+      </div>
+    </div>
+  );
+
+  // ── Empty state ──
+  if (total === 0) return (
+    <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"36px 40px", maxWidth:400, width:"90vw", textAlign:"center", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+        <div style={{ fontSize:40, marginBottom:16 }}>✦</div>
+        <div style={{ fontSize:20, fontWeight:700, color:C.l1 }}>Niente da chiudere.</div>
+        <div style={{ fontSize:14, color:C.l3, marginTop:8, marginBottom:24 }}>Agenda vuota, inbox pulita. Ottimo lavoro.</div>
+        <button onClick={onClose} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:12, padding:"11px 28px", fontWeight:600, fontSize:15, cursor:"pointer" }}>Chiudi</button>
+      </div>
+    </div>
+  );
+
+  // ── Classification sub-form (renders on top of review) ──
+  if (classifying) return (
+    <TaskForm
+      initial={{ ...classifying }}
+      onSave={handleInboxClassified}
+      onClose={() => setClassifying(null)}
+    />
+  );
+
+  // ── Section label helper ──
+  const SectionLabel = ({ color, label, count }) => (
+    <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:10 }}>
+      <div style={{ width:5, height:5, borderRadius:"50%", background:color, flexShrink:0 }} />
+      <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:1.1 }}>{label.toUpperCase()}</span>
+      <span style={{ fontSize:12, color:C.l3 }}>{count}</span>
+    </div>
+  );
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(24px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"28px 28px 24px", width:540, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+
+        {/* Header */}
+        <div style={{ marginBottom:20, flexShrink:0 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <div style={{ fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Chiusura giornata</div>
+              <div style={{ fontSize:12, color:C.l3, marginTop:3 }}>{now} · {total} voci da sistemare</div>
+            </div>
+            <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
+          </div>
+          <div style={{ marginTop:14, background:C.s3, borderRadius:4, height:3, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${pct}%`, background:C.green, borderRadius:4, transition:"width 0.4s" }} />
+          </div>
+          <div style={{ fontSize:11, color:C.l3, marginTop:5 }}>{decided} di {total} decisi</div>
+        </div>
+
+        {/* Scrollable body */}
+        <div style={{ overflowY:"auto", flex:1, display:"flex", flexDirection:"column", gap:8, marginBottom:16 }}>
+
+          {/* ── Sezione 1: Task aperti ── */}
+          {reviewItems.length > 0 && (
+            <>
+              <SectionLabel color={C.red} label="Task aperti" count={reviewItems.length} />
+              {reviewItems.map(t => {
+                const dec = decisions[t.id];
+                const dL  = t.end ? workDiff(today, t.end) : null;
+                const isOverdue = dL !== null && dL < 0;
+                return (
+                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.2s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:dec ? 0 : 10 }}>
+                      <div style={{ width:7, height:7, borderRadius:"50%", background:t.color, flexShrink:0 }} />
+                      <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
+                      {isOverdue && <span style={{ fontSize:10, color:C.red, fontWeight:600 }}>scaduto</span>}
+                    </div>
+                    {!dec ? (
+                      <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+                        <button onClick={() => decide(t.id, "done")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:`${C.green}22`, color:C.green, cursor:"pointer", fontSize:12, fontWeight:600 }}>✓ Fatto</button>
+                        <button onClick={() => decide(t.id, "tomorrow")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>→ Domani</button>
+                        <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                          <input type="date" value={customDate[t.id] || ""} min={T(2)}
+                            onChange={e => setCustomDate(d => ({ ...d, [t.id]: e.target.value }))}
+                            style={{ background:C.s3, border:"none", borderRadius:9, padding:"6px 10px", color:C.l2, fontSize:12, colorScheme: C === LIGHT ? "light" : "dark", fontFamily:"inherit", cursor:"pointer" }} />
+                          {customDate[t.id] && (
+                            <button onClick={() => decide(t.id, `date:${customDate[t.id]}`)} style={{ padding:"6px 10px", borderRadius:9, border:"none", background:`${C.orange}22`, color:C.orange, cursor:"pointer", fontSize:12, fontWeight:600 }}>OK</button>
+                          )}
+                        </div>
+                        <button onClick={() => decide(t.id, "drop")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>Lascia stare</button>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                        <span style={{ fontSize:12, color:C.l3 }}>
+                          {dec === "done" ? "✓ Segnato completato" :
+                           dec === "tomorrow" ? "→ Spostato a domani" :
+                           dec === "drop" ? "Lasciato in lista" :
+                           `→ ${fmtDate(dec.replace("date:", ""))}`}
+                        </span>
+                        <button onClick={() => setDecisions(d => { const n={...d}; delete n[t.id]; return n; })} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:11 }}>annulla</button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
+
+          {/* ── Separatore ── */}
+          {reviewItems.length > 0 && inboxItems.length > 0 && (
+            <div style={{ height:1, background:C.sep, margin:"8px 0" }} />
+          )}
+
+          {/* ── Sezione 2: Inbox ── */}
+          {inboxItems.length > 0 && (
+            <>
+              <SectionLabel color={C.yellow} label="Inbox da elaborare" count={inboxItems.length} />
+              {inboxItems.map(t => {
+                const dec = inboxDec[t.id];
+                return (
+                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.2s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:dec ? 0 : 10 }}>
+                      <div style={{ width:7, height:7, borderRadius:"50%", background:C.yellow, flexShrink:0 }} />
+                      <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
+                      <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>
+                    </div>
+                    {!dec ? (
+                      <div style={{ display:"flex", gap:6 }}>
+                        <button onClick={() => setClassifying(t)}
+                          style={{ padding:"6px 14px", borderRadius:9, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>
+                          Classifica →
+                        </button>
+                        <button onClick={() => decideInbox(t.id, "tomorrow")}
+                          style={{ padding:"6px 13px", borderRadius:9, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>
+                          Lascia in inbox
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                        <span style={{ fontSize:12, color:C.l3 }}>
+                          {dec === "classified" ? "✓ Classificato" : "Lasciato in inbox"}
+                        </span>
+                        <button onClick={() => setInboxDec(d => { const n={...d}; delete n[t.id]; return n; })} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:11 }}>annulla</button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </>
+          )}
+        </div>
+
+        {/* Commit */}
+        <button onClick={commit} disabled={!allDone}
+          style={{ width:"100%", padding:"13px", borderRadius:14, border:"none", background:allDone ? C.green : C.s3, color:allDone ? "#fff" : C.l3, cursor:allDone ? "pointer" : "default", fontSize:15, fontWeight:700, transition:"all 0.25s", letterSpacing:-0.2, flexShrink:0 }}>
+          {allDone ? "Chiudi la giornata →" : `Decidi tutto (${total - decided} ${total - decided === 1 ? "rimasto" : "rimasti"})`}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Confirm Dialog ──
+function ConfirmDialog({ message, onConfirm, onCancel }) {
+  const C = useContext(ThemeCtx);
+  return (
+    <div onClick={onCancel} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", backdropFilter:"blur(16px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:400 }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:18, padding:"28px 28px 22px", width:340, maxWidth:"90vw", boxShadow:"0 24px 60px rgba(0,0,0,0.5)" }}>
+        <div style={{ fontSize:15, fontWeight:600, color:C.l1, marginBottom:8, lineHeight:1.4 }}>{message}</div>
+        <div style={{ fontSize:13, color:C.l3, marginBottom:22 }}>Questa azione è irreversibile.</div>
+        <div style={{ display:"flex", gap:8 }}>
+          <button onClick={onCancel} style={{ flex:1, padding:"11px", borderRadius:11, border:"none", background:C.s2, color:C.l2, cursor:"pointer", fontSize:14, fontWeight:500 }}>Annulla</button>
+          <button onClick={onConfirm} style={{ flex:1, padding:"11px", borderRadius:11, border:"none", background:C.red, color:"#fff", cursor:"pointer", fontSize:14, fontWeight:600 }}>Elimina</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Trash Modal ──
+function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestoreAtt, onDeleteAtt, onEmpty }) {
+  const C = useContext(ThemeCtx);
+  const [confirm, setConfirm] = useState(null);
+  const total = trash.length + attTrash.length;
+
+  function handleConfirm() {
+    if (!confirm) return;
+    if (confirm === "all") onEmpty();
+    else if (confirm.startsWith("task:")) onDeleteOne(Number(confirm.replace("task:", "")));
+    else if (confirm.startsWith("att:"))  onDeleteAtt(confirm.replace("att:", ""));
+    setConfirm(null);
+  }
+
+  const fmtDeleted = iso => {
+    const d = new Date(iso);
+    return d.toLocaleDateString("it-IT", { day:"2-digit", month:"short" }) + " " + d.toLocaleTimeString("it-IT", { hour:"2-digit", minute:"2-digit" });
+  };
+
+  const fmtSize = bytes => bytes < 1024*1024
+    ? `${(bytes/1024).toFixed(0)} KB`
+    : `${(bytes/1024/1024).toFixed(1)} MB`;
+
+  const iconFor = type => type && type.startsWith("image/") ? "blocks" : "archive";
+
+  return (
+    <>
+      <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300 }}>
+        <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px 24px 20px", width:500, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+
+          {/* Header */}
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18, flexShrink:0 }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.l2} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+              </svg>
+              <span style={{ fontSize:16, fontWeight:700, color:C.l1 }}>Cestino</span>
+              <span style={{ fontSize:12, color:C.l3 }}>{total} {total === 1 ? "elemento" : "elementi"}</span>
+            </div>
+            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+              {total > 0 && (
+                <button onClick={() => setConfirm("all")}
+                  style={{ fontSize:12, color:C.red, background:`${C.red}15`, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
+                  Svuota cestino
+                </button>
+              )}
+              <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+            </div>
+          </div>
+
+          {/* Empty state */}
+          {total === 0 ? (
+            <div style={{ textAlign:"center", padding:"48px 0", color:C.l3 }}>
+              <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom:12, opacity:0.4 }}>
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+              </svg>
+              <div style={{ fontSize:14 }}>Il cestino è vuoto</div>
+            </div>
+          ) : (
+            <div style={{ overflowY:"auto", flex:1, display:"flex", flexDirection:"column", gap:14 }}>
+
+              {/* Tasks section */}
+              {trash.length > 0 && (
+                <div>
+                  <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:6 }}>TASK</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                    {trash.map(t => (
+                      <div key={t.id} style={{ background:C.s2, borderRadius:12, padding:"11px 13px", display:"flex", alignItems:"center", gap:10 }}>
+                        <div style={{ width:7, height:7, borderRadius:"50%", background:t.color, flexShrink:0 }} />
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontSize:13, fontWeight:600, color:C.l2, marginBottom:1 }}>{t.title}</div>
+                          <div style={{ fontSize:11, color:C.l3 }}>
+                            {t.type === "inbox" ? "Inbox" : t.type === "project" ? "Progetto" : "Azione"}
+                            {t.deletedAt && <span> · {fmtDeleted(t.deletedAt)}</span>}
+                          </div>
+                        </div>
+                        <button onClick={() => onRestore(t.id)}
+                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
+                          Ripristina
+                        </button>
+                        <button onClick={() => setConfirm(`task:${t.id}`)}
+                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
+                          Elimina
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Attachments section */}
+              {attTrash.length > 0 && (
+                <div>
+                  <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:6 }}>ALLEGATI</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                    {attTrash.map(a => (
+                      <div key={a.id} style={{ background:C.s2, borderRadius:12, padding:"11px 13px", display:"flex", alignItems:"center", gap:10 }}>
+                        <span style={{ color:C.l3, flexShrink:0 }}><Icon name={iconFor(a.type)} size={13} color="currentColor"/></span>
+                        <div style={{ flex:1, minWidth:0 }}>
+                          <div style={{ fontSize:13, fontWeight:600, color:C.l2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", marginBottom:1 }}>{a.name}</div>
+                          <div style={{ fontSize:11, color:C.l3 }}>
+                            {fmtSize(a.size)}
+                            {a.taskTitle && <span> · da "{a.taskTitle}"</span>}
+                            {a.deletedAt && <span> · {fmtDeleted(a.deletedAt)}</span>}
+                          </div>
+                        </div>
+                        <button onClick={() => onRestoreAtt(a.id)}
+                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
+                          Ripristina
+                        </button>
+                        <button onClick={() => setConfirm(`att:${a.id}`)}
+                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
+                          Elimina
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+            </div>
+          )}
+        </div>
+      </div>
+
+      {confirm && (
+        <ConfirmDialog
+          message={confirm === "all" ? `Eliminare definitivamente tutti i ${total} elementi nel cestino?` : "Eliminare definitivamente questo elemento?"}
+          onConfirm={handleConfirm}
+          onCancel={() => setConfirm(null)}
+        />
+      )}
+    </>
+  );
+}
+
+function DoneSection({ done, sel, setSel, setTasks, trashAll, sep }) {
+  const C = useContext(ThemeCtx);
+  const [collapsed, setCollapsed] = useState(function() {
+    try { return localStorage.getItem(LS_DONE_HIDE) === "1"; } catch(e) { return false; }
+  });
+  function toggleCollapsed() {
+    setCollapsed(function(c) {
+      var next = !c;
+      try { localStorage.setItem(LS_DONE_HIDE, next ? "1" : "0"); } catch(e) {}
+      return next;
+    });
+  }
+  return (
+    <div style={{ marginBottom:24 }} onClick={e => e.stopPropagation()}>
+      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:9, cursor:"pointer", userSelect:"none" }} onClick={toggleCollapsed}>
+        <div style={{ width:5, height:5, borderRadius:"50%", background:C.l3 }} />
+        <span style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:1.1 }}>COMPLETATI</span>
+        <span style={{ fontSize:12, color:C.l3 }}>{done.length}</span>
+        <button onClick={e => { e.stopPropagation(); trashAll(done.map(t => t.id)); }}
+          style={{ marginLeft:"auto", fontSize:11, color:C.l3, background:"none", border:`1px solid ${sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+          Sposta nel cestino
+        </button>
+        <span style={{ color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.2s", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
+          <svg width="12" height="7" viewBox="0 0 12 7" fill="none"><path d="M1 1L6 6L11 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+        </span>
+      </div>
+      {!collapsed && (
+        <div style={{ background:C.s1, borderRadius:16, overflow:"hidden", opacity:0.5, boxShadow:C.shadow }}>
+          {done.map((t, idx) => (
+            <div key={t.id} onClick={() => setSel(sel===t.id?null:t.id)}
+              style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 16px", borderBottom:idx < done.length-1 ? `1px solid ${C.sep}` : "none", cursor:"pointer" }}>
+              <div onClick={e => { e.stopPropagation(); setTasks(ts => ts.map(u => u.id === t.id ? { ...u, progress:0 } : u)); setSel(null); }}
+                title="Segna come non completato"
+                style={{ width:13, height:13, borderRadius:"50%", background:C.green, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, cursor:"pointer", transition:"opacity 0.15s" }}
+                onMouseEnter={e => e.currentTarget.style.opacity="0.4"}
+                onMouseLeave={e => e.currentTarget.style.opacity="1"}>
+                <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
+              </div>
+              <span style={{ fontSize:13, color:C.l3, textDecoration:"line-through", flex:1 }}>{t.title}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function parseDate(str) {
+  if (!str) return null;
+  var p = str.split("-");
+  return p.length === 3 ? new Date(+p[0], +p[1]-1, +p[2]) : null;
+}
+function addDays(d, n) { var r = new Date(d); r.setDate(r.getDate()+n); return r; }
+function diffDays(a, b) { return Math.round((b - a) / 86400000); }
+
+function GanttView({ tasks, onSelect }) {
+  const C = useContext(ThemeCtx);
+  const [offset, setOffset] = useState(0);
+
+  const WEEKS = 12;
+  const LABEL_W = 180;
+  const BAR_H = 20;
+  const ROW_H = 46;
+  const HEAD_H = 32;
+  const SUBH_H = 22;
+
+  function fmtShort(d) { return d.toLocaleDateString("it-IT", { day:"numeric", month:"short" }); }
+  function fmtMonth(d) { return d.toLocaleDateString("it-IT", { month:"long" }); }
+
+  const todayD = parseDate(today);
+  const winStart = addDays(todayD, offset * 7 - 28);
+  const winEnd = addDays(winStart, WEEKS * 7);
+  const totalDays = WEEKS * 7;
+
+  // split projects
+  const planned = [], unplanned = [];
+  tasks.forEach(function(t) {
+    if (t.type !== "project" || t.progress === 100) return;
+    let s = parseDate(t.start), e = parseDate(t.end);
+    if (s && e && e >= s) planned.push(t);
+    else unplanned.push(t);
+  });
+  planned.sort(function(a,b){ return parseDate(a.start) - parseDate(b.start); });
+
+  // ── month / week markers ──
+  const months = [];
+  let mc = new Date(winStart.getFullYear(), winStart.getMonth(), 1);
+  while (mc <= winEnd) {
+    const pct = diffDays(winStart, mc) / totalDays * 100;
+    if (pct < 100) months.push({ pct: Math.max(0, pct), label: fmtMonth(mc) });
+    mc = new Date(mc.getFullYear(), mc.getMonth()+1, 1);
+  }
+
+  const weeks = [];
+  let wc = new Date(winStart);
+  const wd = wc.getDay();
+  wc = addDays(wc, wd === 1 ? 0 : wd === 0 ? 1 : 8 - wd);
+  while (wc <= winEnd) {
+    const wp = diffDays(winStart, wc) / totalDays * 100;
+    if (wp >= 0 && wp <= 100) weeks.push({ pct: wp, label: fmtShort(wc) });
+    wc = addDays(wc, 7);
+  }
+
+  const todayPct = diffDays(winStart, todayD) / totalDays * 100;
+  const showToday = todayPct >= 0 && todayPct <= 100;
+
+  const sep = "1px solid " + C.sep;
+
+  // ── bar geometry from a task ──
+  function barGeom(task) {
+    let s = parseDate(task.start);
+    let e = parseDate(task.end);
+    const pctS = diffDays(winStart, s) / totalDays * 100;
+    const pctE = diffDays(winStart, addDays(e, 1)) / totalDays * 100;
+    const left = Math.max(0, pctS);
+    const right = Math.min(100, pctE);
+    return { left: left, width: Math.max(0.5, right - left), clipped: pctS < 0 || pctE > 100 };
+  }
+
+  return (
+    <div style={{ flex:1, overflowY:"auto", padding:"20px 24px" }}>
+
+      {/* Controls */}
+      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:20, flexWrap:"wrap" }}>
+        <button onClick={() => setOffset(o => o-2)}
+          style={{ background:C.s2, border:"none", borderRadius:8, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>‹</button>
+        <button onClick={() => setOffset(0)}
+          style={{ background: offset===0 ? `${C.blue}22` : C.s2, border:"none", borderRadius:8, padding:"5px 14px", cursor:"pointer", color: offset===0 ? C.blue : C.l2, fontSize:12, fontWeight:600, fontFamily:"inherit" }}>Oggi</button>
+        <button onClick={() => setOffset(o => o+2)}
+          style={{ background:C.s2, border:"none", borderRadius:8, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>›</button>
+        <span style={{ fontSize:12, color:C.l3 }}>{fmtShort(winStart)} → {fmtShort(winEnd)}</span>
+      </div>
+
+      {/* Timeline table */}
+      {planned.length > 0 && (
+        <div style={card(C)}>
+
+          {/* Month row */}
+          <div style={{ display:"flex", borderBottom:sep, height:HEAD_H }}>
+            <div style={{ width:LABEL_W, flexShrink:0, display:"flex", alignItems:"center", paddingLeft:14 }}>
+              <span style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:0.8 }}>PROGETTO</span>
+            </div>
+            <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
+              {months.map(function(m,i){
+                return (
+                  <div key={i} style={{ position:"absolute", left:m.pct+"%", top:0, bottom:0, borderLeft:`1px solid ${C.sep}` }}>
+                    <span style={{ position:"absolute", top:7, left:6, fontSize:10, fontWeight:700, color:C.l2, whiteSpace:"nowrap" }}>{m.label}</span>
+                  </div>
+                );
+              })}
+              {showToday && <div style={{ position:"absolute", left:todayPct+"%", top:0, bottom:0, width:2, background:C.red, opacity:0.85, transform:"translateX(-50%)", zIndex:2 }} />}
+            </div>
+          </div>
+
+          {/* Week row */}
+          <div style={{ display:"flex", borderBottom:sep, height:SUBH_H }}>
+            <div style={{ width:LABEL_W, flexShrink:0 }} />
+            <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
+              {weeks.map(function(wk,i){
+                return (
+                  <div key={i} style={{ position:"absolute", left:wk.pct+"%", top:0, bottom:0 }}>
+                    <div style={{ position:"absolute", top:0, left:0, width:1, bottom:0, background:C.sep, opacity:0.6 }} />
+                    <span style={{ position:"absolute", top:4, left:4, fontSize:9, color:C.l3, whiteSpace:"nowrap" }}>{wk.label}</span>
+                  </div>
+                );
+              })}
+              {showToday && <div style={{ position:"absolute", left:todayPct+"%", top:0, bottom:0, width:2, background:C.red, opacity:0.85, transform:"translateX(-50%)", zIndex:2 }} />}
+            </div>
+          </div>
+
+          {/* Project rows */}
+          {planned.map(function(task, idx){
+            const g = barGeom(task);
+            const prog = task.progress || 0;
+            const daysLeft = diffDays(todayD, parseDate(task.end));
+            const isLate = daysLeft < 0 && prog < 100;
+
+            return (
+              <div key={task.id}
+                style={{ display:"flex", alignItems:"stretch", borderBottom: idx < planned.length-1 ? sep : "none", cursor:"pointer", transition:"background 0.12s" }}
+                onMouseEnter={function(ev){ ev.currentTarget.style.background = C.s2; }}
+                onMouseLeave={function(ev){ ev.currentTarget.style.background = ""; }}
+                onClick={() => onSelect(task.id)}>
+
+                {/* Label */}
+                <div style={{ width:LABEL_W, flexShrink:0, padding:"0 14px", display:"flex", flexDirection:"column", justifyContent:"center", minHeight:ROW_H }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:2 }}>
+                    <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
+                    <span style={{ fontSize:12, fontWeight:600, color: isLate ? C.red : C.l1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{task.title}</span>
+                  </div>
+                  <div style={{ fontSize:10, color: isLate ? C.red : C.l3, paddingLeft:13 }}>
+                    {isLate
+                      ? "ritardo "+Math.abs(daysLeft)+"g"
+                      : prog > 0
+                        ? prog+"%"
+                        : daysLeft+"g rimanenti"
+                    }
+                  </div>
+                </div>
+
+                {/* Bar canvas */}
+                <div style={{ flex:1, position:"relative", minHeight:ROW_H, overflow:"hidden" }}>
+                  {/* Grid lines */}
+                  {weeks.map(function(wk,i){
+                    return <div key={i} style={{ position:"absolute", left:wk.pct+"%", top:0, bottom:0, width:1, background:C.sep, opacity:0.35 }} />;
+                  })}
+
+                  {/* Today */}
+                  {showToday && <div style={{ position:"absolute", left:todayPct+"%", top:0, bottom:0, width:2, background:C.red, opacity:0.7, transform:"translateX(-50%)", zIndex:3 }} />}
+
+                  {/* Bar background */}
+                  <div style={{
+                    position:"absolute",
+                    left:   g.left + "%",
+                    width:  g.width + "%",
+                    top:    "50%",
+                    height: BAR_H,
+                    marginTop: -(BAR_H/2),
+                    borderRadius: 6,
+                    background: task.color + "40",
+                    border: "2px solid " + task.color + "90",
+                    overflow:"hidden",
+                    boxSizing:"border-box"
+                  }}>
+                    {/* Progress fill */}
+                    {prog > 0 && (
+                      <div style={{ width:prog+"%", height:"100%", background:task.color, borderRadius:4, opacity:0.85 }} />
+                    )}
+                  </div>
+
+                  {/* % label */}
+                  {prog > 0 && g.width > 8 && (
+                    <div style={{ position:"absolute", left:g.left+"%", width:g.width+"%", top:"50%", height:BAR_H, marginTop:-(BAR_H/2), display:"flex", alignItems:"center", justifyContent:"center", pointerEvents:"none", zIndex:4 }}>
+                      <span style={{ fontSize:9, fontWeight:800, color:"#fff", textShadow:"0 1px 3px rgba(0,0,0,0.6)" }}>{prog}%</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+
+        </div>
+      )}
+
+      {/* Unplanned projects */}
+      {unplanned.length > 0 && (
+        <div style={{ marginTop:24 }}>
+          <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:8 }}>SENZA DATE</div>
+          <div style={card(C)}>
+            {unplanned.map(function(task,idx){
+              return (
+                <div key={task.id}
+                  style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 16px", borderBottom: idx < unplanned.length-1 ? sep : "none", cursor:"pointer" }}
+                  onClick={() => onSelect(task.id)}
+                  onMouseEnter={function(ev){ ev.currentTarget.style.background = C.s2; }}
+                  onMouseLeave={function(ev){ ev.currentTarget.style.background = ""; }}>
+                  <div style={{ width:6, height:6, borderRadius:"50%", background:task.color, flexShrink:0 }} />
+                  <span style={{ fontSize:13, color:C.l2 }}>{task.title}</span>
+                  <span style={{ fontSize:11, color:C.l3, marginLeft:"auto" }}>Aggiungi date di inizio e fine per visualizzare</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
+      {planned.length === 0 && unplanned.length === 0 && (
+        <div style={{ textAlign:"center", padding:"80px 0", color:C.l3 }}>
+          <div style={{ fontSize:30, marginBottom:12 }}>✦</div>
+          <div style={{ fontSize:15 }}>Nessun progetto attivo. Crea un task di tipo Progetto con date di inizio e fine.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Saved indicator ──
+function SavedIndicator({ savedAt }) {
+  const C = useContext(ThemeCtx);
+  const [visible, setVisible] = useState(false);
+
+  useEffect(() => {
+    if (!savedAt) return;
+    setVisible(true);
+    const t = setTimeout(() => setVisible(false), 2000);
+    return function() { clearTimeout(t); };
+  }, [savedAt]);
+
+  return (
+    <span style={{
+      fontSize:11, color:C.teal, fontWeight:500,
+      opacity: visible ? 1 : 0,
+      transition: visible ? "opacity 0.15s" : "opacity 0.6s",
+      pointerEvents:"none", userSelect:"none", whiteSpace:"nowrap"
+    }}>
+      · salvato
+    </span>
+  );
+}
+
+function App() {
+  // ── Persistence: load from localStorage on first render ──
+  const [tasks, setTasks] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (raw) return JSON.parse(raw).map(normalizeTask);
+    } catch(e) {}
+    return [];
+  });
+
+  const [trash, setTrash] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LS_TRASH);
+      if (raw) return JSON.parse(raw).map(normalizeTask);
+    } catch(e) {}
+    return [];
+  });
+
+  const [attTrash, setAttTrash] = useState(() => {
+    try {
+      const raw = localStorage.getItem(LS_ATT_TRASH);
+      if (raw) return JSON.parse(raw);
+    } catch(e) {}
+    return [];
+  });
+
+  const [isDark, setIsDark] = useState(() => {
+    try { return localStorage.getItem(LS_THEME) !== "light"; } catch(e) { return true; }
+  });
+
+  const [savedAt, setSavedAt] = useState(null);
+  const [busyHours, setBusyHours] = useState(function() {
+    try {
+      var raw = localStorage.getItem(LS_BUSY + "_" + today);
+      return raw !== null ? parseFloat(raw) : 0;
+    } catch(e) { return 0; }
+  });
+  useEffect(function() {
+    try { localStorage.setItem(LS_BUSY + "_" + today, String(busyHours)); } catch(e) {}
+  }, [busyHours]);
+
+  // ── Persistence: save to localStorage on every change ──
+  useEffect(() => {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(tasks)); setSavedAt(Date.now()); } catch(e) {}
+  }, [tasks]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_TRASH, JSON.stringify(trash)); setSavedAt(Date.now()); } catch(e) {}
+  }, [trash]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_ATT_TRASH, JSON.stringify(attTrash)); setSavedAt(Date.now()); } catch(e) {}
+  }, [attTrash]);
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_THEME, isDark ? "dark" : "light"); } catch(e) {}
+  }, [isDark]);
+
+  const [sel, setSel]           = useState(null);
+  const [showForm, setShowForm] = useState(false);
+  const [editTask, setEditTask] = useState(null);
+  const [showReview, setShowReview] = useState(false);
+  const [showTrash, setShowTrash]   = useState(false);
+  const [viewMode, setViewMode]     = useState("agenda"); // "agenda" | "gantt"
+  const [query, setQuery]           = useState("");
+  const searchRef = useRef(null);
+  const importRef = useRef(null);
+
+  const C = isDark ? DARK : LIGHT;
+
+  // ── Trash mutators ──
+  const moveToTrash = id => {
+    const t = tasks.find(t => t.id === id);
+    if (!t) return;
+    setTrash(tr => [...tr, { ...t, deletedAt: new Date().toISOString() }]);
+    setTasks(ts => ts.filter(t => t.id !== id));
+    setSel(null);
+  };
+  const trashAll = ids => {
+    const now = new Date().toISOString();
+    const toMove = tasks.filter(t => ids.includes(t.id));
+    setTrash(tr => [...tr, ...toMove.map(t => ({ ...t, deletedAt: now }))]);
+    setTasks(ts => ts.filter(t => !ids.includes(t.id)));
+  };
+  const restoreFromTrash = id => {
+    const t = trash.find(t => t.id === id);
+    if (!t) return;
+    const { deletedAt, ...restored } = t;
+    setTasks(ts => [...ts, restored]);
+    setTrash(tr => tr.filter(t => t.id !== id));
+  };
+  const deleteFromTrash = id => {
+    const t = trash.find(t => t.id === id);
+    if (t) (t.attachments || []).forEach(a => idbDelete(a.id));
+    setTrash(tr => tr.filter(t => t.id !== id));
+  };
+  const emptyTrash = () => {
+    trash.forEach(t => (t.attachments || []).forEach(a => idbDelete(a.id)));
+    attTrash.forEach(a => idbDelete(a.id));
+    setTrash([]);
+    setAttTrash([]);
+  };
+
+  // ── Attachment trash mutators ──
+  const trashAttachment = (taskId, taskTitle, meta) => {
+    setTasks(ts => ts.map(t => t.id === taskId
+      ? { ...t, attachments: t.attachments.filter(a => a.id !== meta.id) }
+      : t
+    ));
+    setAttTrash(at => [...at, { ...meta, taskId, taskTitle, deletedAt: new Date().toISOString() }]);
+  };
+  const restoreAttachment = id => {
+    const att = attTrash.find(a => a.id === id);
+    if (!att) return;
+    const { taskId, taskTitle, deletedAt, ...meta } = att;
+    setTasks(ts => ts.map(t => t.id === taskId
+      ? { ...t, attachments: [...(t.attachments || []), meta] }
+      : t
+    ));
+    setAttTrash(at => at.filter(a => a.id !== id));
+  };
+  const deleteAttachment = id => {
+    idbDelete(id);
+    setAttTrash(at => at.filter(a => a.id !== id));
+  };
+
+  // ── Export / Import ──
+  function exportJSON() {
+    const blob = new Blob([JSON.stringify({ tasks, trash }, null, 2)], { type:"application/json" });
+    const url  = URL.createObjectURL(blob);
+    const a    = document.createElement("a");
+    const date = new Date().toISOString().slice(0,10);
+    a.href = url; a.download = `time-manager-${date}.json`;
+    a.click(); URL.revokeObjectURL(url);
+  }
+
+  function importJSON(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      try {
+        const parsed = JSON.parse(ev.target.result);
+        // Support both old format (array) and new format ({tasks, trash})
+        const newTasks = Array.isArray(parsed) ? parsed : (parsed.tasks || []);
+        const newTrash = Array.isArray(parsed) ? [] : (parsed.trash || []);
+        if (!Array.isArray(newTasks)) throw new Error("Formato non valido");
+        setTasks(newTasks.map(normalizeTask));
+        setTrash(newTrash.map(normalizeTask));
+        setSel(null);
+      } catch(err) {
+        alert("Errore nel file: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = "";
+  }
+
+  // ── Computed groups ──
+  const groups = useMemo(() => {
+    const active     = tasks.filter(t => t.progress < 100);
+    const waiting    = active.filter(t => t.waiting && t.type !== "inbox");
+    const actionable = active.filter(t => !t.waiting);
+    const inbox   = actionable.filter(t => t.type === "inbox");
+    const today_  = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "today");
+    const week    = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "week");
+    const month   = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "month");
+    const backlog = actionable.filter(t => t.type !== "inbox" && computeHz(t) === "backlog");
+    const done    = tasks.filter(t => t.progress >= 100);
+    const load    = today_.reduce((s, t) => s + (DURATION_MAP[t.duration] ? DURATION_MAP[t.duration].hours : 0), 0);
+    const projects = actionable.filter(t => t.type === "project");
+    return { inbox, today: today_, week, month, backlog, done, load, projects, waiting };
+  }, [tasks]);
+
+  const freeHours = Math.max(0, 8 - busyHours);
+
+  const suggestions = useMemo(() => computeSuggestions({
+    todayItems:   groups.today,
+    inboxItems:   groups.inbox,
+    projects:     groups.projects,
+    backlogItems: groups.backlog,
+    waitingItems: groups.waiting,
+    load:         groups.load,
+    freeHours:    freeHours,
+  }), [groups, freeHours]);
+
+  const selTask = tasks.find(t => t.id === sel);
+
+  // ── Keyboard shortcut: Cmd/Ctrl+K to focus search ──
+  useEffect(() => {
+    function onKey(e) {
+      if ((e.metaKey || e.ctrlKey) && e.key === "k") {
+        e.preventDefault();
+        if (searchRef.current) { searchRef.current.focus(); searchRef.current.select(); }
+      }
+    }
+    document.addEventListener("keydown", onKey);
+    return function() { document.removeEventListener("keydown", onKey); };
+  }, []);
+
+  const searchResults = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return null;
+    return tasks.filter(t => {
+      if (t.progress >= 100) return false;
+      if (t.title.toLowerCase().includes(q)) return true;
+      if (t.description && t.description.toLowerCase().includes(q)) return true;
+      if (t.subtasks.some(s => s.label.toLowerCase().includes(q))) return true;
+      if (t.waitingFor && t.waitingFor.toLowerCase().includes(q)) return true;
+      return false;
+    });
+  }, [query, tasks]);
+
+  // ── Mutators ──
+  const saveNew  = f => { setTasks(ts => [...ts, { waiting:false, waitingFor:"", waitingSince:"", ...f, id:Date.now() }]); setShowForm(false); };
+  const saveEdit = f => {
+    const prog = f.subtasks.length ? calcProg(f.subtasks) : f.progress;
+    setTasks(ts => ts.map(t => t.id === f.id ? { ...f, progress:prog } : t));
+    setEditTask(null);
+  };
+
+  const addSub  = (tid, label) => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    const subs = [...t.subtasks, { id:Date.now(), label, done:false }];
+    return { ...t, subtasks:subs, progress:calcProg(subs) };
+  }));
+  const delSub  = (tid, sid) => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    const subs = t.subtasks.filter(s => s.id !== sid);
+    return { ...t, subtasks:subs, progress:calcProg(subs) };
+  }));
+  const toggleSub = (tid, sid) => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    const subs = t.subtasks.map(s => s.id === sid ? { ...s, done:!s.done } : s);
+    return { ...t, subtasks:subs, progress:calcProg(subs) };
+  }));
+  const setNext = (tid, sid) => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    const found   = t.subtasks.find(s => s.id === sid);
+    const already = found ? found.next : false;
+    return { ...t, subtasks:t.subtasks.map(s => ({ ...s, next:!already && s.id === sid })) };
+  }));
+  const updateProg     = (tid, v) => setTasks(ts => ts.map(t => t.id === tid && !t.subtasks.length ? { ...t, progress:v } : t));
+  const completeTask   = tid => setTasks(ts => ts.map(t => t.id === tid ? { ...t, progress:100 } : t));
+  const uncompleteTask = tid => { setTasks(ts => ts.map(t => t.id === tid ? { ...t, progress:0 } : t)); };
+
+  const addAttachment    = (tid, meta) => setTasks(ts => ts.map(t => t.id === tid ? { ...t, attachments:[...(t.attachments||[]), meta] } : t));
+  const removeAttachment = (taskId, meta) => trashAttachment(taskId, (tasks.find(t => t.id === taskId) || {}).title || "", meta);
+  const toggleWaiting = tid => setTasks(ts => ts.map(t => {
+    if (t.id !== tid) return t;
+    const nowWaiting = !t.waiting;
+    return { ...t, waiting:nowWaiting, waitingSince:nowWaiting ? today : "", waitingFor:nowWaiting ? t.waitingFor : "" };
+  }));
+  const quickAdd = title => setTasks(ts => [...ts, { ...EMPTY_TASK, id:Date.now(), title, type:"inbox", urgency:null, importance:null }]);
+  const newEmpty = () => ({ ...EMPTY_TASK, start:today, color: PALETTE[Math.floor(Math.random() * PALETTE.length)] });
+
+  const handleReviewDecide = (tid, action, date) => {
+    setTasks(ts => ts.map(t => {
+      if (t.id !== tid) return t;
+      if (action === "done")     return { ...t, progress:100 };
+      if (action === "postpone") return { ...t, end:date };
+      return t;
+    }));
+  };
+
+  // Called when user classifies an inbox task from within EndOfDayReview
+  const handleClassifyInbox = f => {
+    const prog = f.subtasks.length ? calcProg(f.subtasks) : f.progress;
+    const hz   = f.urgency && f.importance ? baseHz(f.urgency, f.importance) : "backlog";
+    setTasks(ts => ts.map(t => t.id === f.id ? { ...f, progress:prog, horizon:hz } : t));
+  };
+
+  return (
+    <ThemeCtx.Provider value={C}>
+    <div style={{ fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',sans-serif", background:C.bg, minHeight:"100vh", color:C.l1, transition:"background 0.3s, color 0.3s" }}>
+      <style>{`
+        @keyframes panelIn{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:translateX(0)}}
+        *{box-sizing:border-box}
+        ::-webkit-scrollbar{width:3px}
+        ::-webkit-scrollbar-track{background:transparent}
+        ::-webkit-scrollbar-thumb{background:${C.s3};border-radius:3px}
+        input[type=date]::-webkit-calendar-picker-indicator{filter:${isDark ? "invert(0.5)" : "none"};cursor:pointer}
+        input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:${C.s3};outline:none}
+        input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;cursor:pointer;margin-top:-6px}
+        .agenda-row:hover{background:${C.s2}!important}
+      `}</style>
+
+      {/* Header */}
+      <div style={{ background:C.header, backdropFilter:"blur(20px)", borderBottom:`1px solid ${C.sep}`, padding:"14px 24px", position:"sticky", top:0, zIndex:10 }}>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+          <div style={{ display:"flex", alignItems:"baseline", gap:14 }}>
+            <h1 style={{ margin:0, fontSize:20, fontWeight:700, letterSpacing:-0.5, color:C.l1 }}>Attività</h1>
+            <div style={{ display:"flex", gap:10 }}>
+              {groups.today.length > 0 && <span style={{ fontSize:13, color:C.red }}>{groups.today.length} oggi</span>}
+              {groups.inbox.length > 0 && <span style={{ fontSize:13, color:C.yellow }}>{groups.inbox.length} inbox</span>}
+              {groups.load > 0 && <span style={{ fontSize:13, color:groups.load > freeHours ? C.red : C.l3 }}>~{groups.load < 1 ? "<1" : Math.round(groups.load)}h/{freeHours}h libere</span>}
+            </div>
+            <SavedIndicator savedAt={savedAt} />
+          </div>
+          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            {/* Import (hidden input) */}
+            <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={importJSON} />
+
+            {/* Busy hours input */}
+            <div title="Ore già occupate oggi (riunioni, impegni fissi)" style={{ display:"flex", alignItems:"center", gap:5, background:C.s2, borderRadius:10, padding:"0 10px", height:34, border:`1px solid ${busyHours > 0 ? `${C.orange}60` : "transparent"}`, transition:"border-color 0.2s" }}>
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={busyHours > 0 ? C.orange : C.l3} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink:0 }}>
+                <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+              </svg>
+              <input
+                type="number" min="0" max="8" step="0.5"
+                value={busyHours || ""}
+                onChange={function(e) {
+                  var v = parseFloat(e.target.value);
+                  setBusyHours(isNaN(v) ? 0 : Math.min(8, Math.max(0, v)));
+                }}
+                placeholder="0"
+                title="Ore già occupate oggi"
+                style={{ width:32, background:"none", border:"none", outline:"none", fontSize:13, color:busyHours > 0 ? C.orange : C.l2, fontFamily:"inherit", textAlign:"center", padding:0 }}
+              />
+              <span style={{ fontSize:11, color:C.l3, whiteSpace:"nowrap" }}>h occupate</span>
+            </div>
+
+            {/* Trash button */}
+            <button onClick={() => setShowTrash(true)} title="Cestino"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:(trash.length + attTrash.length) > 0 ? C.red : C.l3, flexShrink:0, position:"relative" }}>
+              <svg width="14" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+              </svg>
+              {(trash.length + attTrash.length) > 0 && (
+                <span style={{ position:"absolute", top:2, right:2, width:8, height:8, borderRadius:"50%", background:C.red, border:`1.5px solid ${C.bg}` }} />
+              )}
+            </button>
+
+            {/* Import button */}
+            <button onClick={() => importRef.current.click()} title="Importa backup JSON"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+              </svg>
+            </button>
+
+            {/* Export button */}
+            <button onClick={exportJSON} title="Esporta backup JSON"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+            </button>
+
+            {/* Search */}
+            <div style={{ position:"relative", display:"flex", alignItems:"center" }}>
+              <div style={{ display:"flex", alignItems:"center", background:C.s2, borderRadius:10, border:`1px solid ${query ? `${C.blue}60` : "transparent"}`, transition:"all 0.2s", overflow:"hidden" }}>
+                <div style={{ display:"flex", alignItems:"center", paddingLeft:10, color:C.l3, flexShrink:0 }}>
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
+                  </svg>
+                </div>
+                <input
+                  ref={searchRef}
+                  value={query}
+                  onChange={e => { setQuery(e.target.value); setSel(null); }}
+                  onKeyDown={e => { if (e.key === "Escape") { setQuery(""); searchRef.current.blur(); } }}
+                  placeholder="Cerca…"
+                  style={{ background:"none", border:"none", outline:"none", fontSize:13, color:C.l1, padding:"7px 10px 7px 7px", width: query ? 180 : 90, transition:"width 0.25s", fontFamily:"inherit" }}
+                />
+                {query && (
+                  <button onClick={() => { setQuery(""); searchRef.current.focus(); }}
+                    style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", padding:"0 8px 0 0", fontSize:14, lineHeight:1, display:"flex", alignItems:"center" }}>✕</button>
+                )}
+              </div>
+            </div>
+
+            {/* View tabs */}
+            <div style={{ display:"flex", background:C.s2, borderRadius:10, padding:3, gap:2 }}>
+              {[["agenda","Agenda"],["gantt","Gantt"]].map(function(pair) {
+                var v = pair[0]; var label = pair[1];
+                return (
+                  <button key={v} onClick={() => setViewMode(v)}
+                    style={{ background: viewMode === v ? C.s1 : "transparent", border:"none", borderRadius:7, padding:"5px 14px", cursor:"pointer", fontSize:12, fontWeight:600, color: viewMode === v ? C.l1 : C.l3, fontFamily:"inherit", transition:"all 0.15s", boxShadow: viewMode === v ? "0 1px 4px rgba(0,0,0,0.15)" : "none" }}>
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Theme toggle */}
+            <button onClick={() => setIsDark(d => !d)} title={isDark ? "Passa a light mode" : "Passa a dark mode"}
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l2, flexShrink:0 }}>
+              {isDark ? (
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+                </svg>
+              ) : (
+                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+                </svg>
+              )}
+            </button>
+
+            {/* Review */}
+            <button onClick={() => setShowReview(true)} title="Chiusura giornata"
+              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l2, flexShrink:0 }}>
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+              </svg>
+            </button>
+
+            <button onClick={() => setShowForm(true)} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"8px 18px", fontWeight:600, fontSize:14, cursor:"pointer", letterSpacing:-0.2 }}>+ Nuovo</button>
+          </div>
+        </div>
+      </div>
+
+      <div style={{ display:"flex", height:"calc(100vh - 57px)" }}>
+        {searchResults ? (
+          /* ── Search results ── */
+          <div onClick={() => setSel(null)} style={{ flex:1, overflowY:"auto", padding:"20px 24px" }}>
+            <div onClick={e => e.stopPropagation()}>
+              <div style={{ display:"flex", alignItems:"baseline", gap:10, marginBottom:16 }}>
+                <span style={{ fontSize:13, fontWeight:700, color:C.l1 }}>
+                  {searchResults.length === 0 ? "Nessun risultato" : `${searchResults.length} risultat${searchResults.length === 1 ? "o" : "i"}`}
+                </span>
+                <span style={{ fontSize:12, color:C.l3 }}>per "{query}"</span>
+              </div>
+              {searchResults.length > 0 && (
+                <div style={card(C)}>
+                  {searchResults.map((task, idx) => {
+                    const q = query.trim().toLowerCase();
+                    const matchSubs = task.subtasks.filter(s => s.label.toLowerCase().includes(q));
+                    const hz = computeHz(task);
+                    const hzC = hzColor(hz, C);
+                    return (
+                      <div key={task.id} style={{ borderBottom: idx < searchResults.length-1 ? `1px solid ${C.sep}` : "none" }}>
+                        <div style={{ display:"flex", alignItems:"stretch", cursor:"pointer", transition:"background 0.1s" }}
+                          onClick={() => setSel(sel === task.id ? null : task.id)}
+                          onMouseEnter={e => e.currentTarget.style.background = C.s2}
+                          onMouseLeave={e => e.currentTarget.style.background = ""}>
+                          {/* Hz color bar */}
+                          <div style={{ width:4, background: task.type === "inbox" ? C.l3 : hzC, flexShrink:0, borderRadius:"4px 0 0 4px" }} />
+                          <div style={{ flex:1, padding:"11px 14px" }}>
+                            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom: matchSubs.length ? 5 : 0 }}>
+                              <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
+                              <span style={{ fontSize:13, fontWeight:600, color:C.l1 }}>{task.title}</span>
+                              <span style={{ fontSize:11, color:C.l3, marginLeft:"auto" }}>
+                                {task.type === "inbox" ? "Inbox" : task.type === "project" ? "Progetto" : "Azione"}
+                              </span>
+                              {task.end && <span style={{ fontSize:11, color:C.l3 }}>→ {fmtDate(task.end)}</span>}
+                            </div>
+                            {task.description && task.description.toLowerCase().includes(q) && (
+                              <div style={{ fontSize:11, color:C.l3, marginTop:3, paddingLeft:15, fontStyle:"italic" }}>
+                                {task.description.slice(0, 100)}{task.description.length > 100 ? "…" : ""}
+                              </div>
+                            )}
+                            {matchSubs.length > 0 && (
+                              <div style={{ display:"flex", flexWrap:"wrap", gap:4, paddingLeft:15, marginTop:4 }}>
+                                {matchSubs.map(s => (
+                                  <span key={s.id} style={{ fontSize:10, color:C.l3, background:C.s3, borderRadius:5, padding:"2px 7px" }}>
+                                    {s.done ? "✓ " : ""}{s.label}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          </div>
+        ) : viewMode === "gantt" ? (
+          <GanttView tasks={tasks} onSelect={id => setSel(sel === id ? null : id)} />
+        ) : (
+        <div onClick={() => setSel(null)} style={{ flex:1, overflowY:"auto", padding:"20px 24px" }}>
+          <div onClick={e => e.stopPropagation()}>
+            <QuickCapture onAdd={quickAdd} />
+            <SuggestionWhisper suggestions={suggestions} />
+          </div>
+
+          {groups.inbox.length > 0 && (
+            <AgendaSection items={groups.inbox} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Inbox" color={C.yellow} />
+          )}
+          <AgendaSection items={groups.today} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask}
+            label="Oggi" color={C.red}
+            extra={groups.load > freeHours ? { text:`~${Math.round(groups.load)}h · overcommitment`, color:C.red } : groups.load > 0 ? { text:`~${groups.load < 1 ? "<1" : Math.round(groups.load)}h stimato`, color:C.l3 } : null} />
+          <AgendaSection items={groups.week} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Questa settimana" color={C.orange} />
+          <AgendaSection items={groups.month} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Prossime settimane" color={C.blue} />
+          <AgendaSection items={groups.backlog} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Backlog" color={C.l3} />
+          {groups.waiting.length > 0 && (
+            <AgendaSection items={groups.waiting} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="In attesa" color={C.teal} />
+          )}
+
+          {groups.done.length > 0 && (
+            <DoneSection done={groups.done} sel={sel} setSel={setSel} setTasks={setTasks} trashAll={trashAll} sep={C.sep} />
+          )}
+
+          {!groups.inbox.length && !groups.today.length && !groups.week.length && !groups.month.length && !groups.backlog.length && !groups.waiting.length && (
+            <div style={{ textAlign:"center", padding:"60px 24px 80px", color:C.l3, userSelect:"none" }}>
+              <div style={{ fontSize:36, marginBottom:16, opacity:0.4 }}>✦</div>
+              <div style={{ fontSize:16, fontWeight:600, color:C.l2, marginBottom:8 }}>Nessun task ancora</div>
+              <div style={{ fontSize:13, color:C.l3, lineHeight:1.6, maxWidth:280, margin:"0 auto 32px" }}>
+                Cattura un pensiero nella barra qui sopra, oppure crea un task strutturato con <span style={{ color:C.blue, fontWeight:500 }}>+ Nuovo</span> in alto a destra.
+              </div>
+              {/* Arrow pointing up toward QuickCapture */}
+              <svg width="24" height="48" viewBox="0 0 24 48" fill="none" style={{ margin:"0 auto", display:"block", opacity:0.3 }}>
+                <line x1="12" y1="48" x2="12" y2="4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeDasharray="4 4"/>
+                <path d="M5 12L12 4L19 12" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/>
+              </svg>
+            </div>
+          )}
+        </div>
+        )} {/* end main view */}
+
+        {selTask && (
+          <DetailPanel task={selTask} onClose={() => setSel(null)}
+            onEdit={() => setEditTask({ ...selTask })} onDelete={moveToTrash} onComplete={completeTask} onUncomplete={uncompleteTask}
+            onToggleSub={toggleSub} onAddSub={addSub} onDelSub={delSub} onSetNext={setNext}
+            onUpdateProg={updateProg} onToggleWaiting={toggleWaiting}
+            onAddAttachment={addAttachment} onRemoveAttachment={removeAttachment} />
+        )}
+      </div>
+
+      {showForm   && <TaskForm initial={newEmpty()}  onSave={saveNew}  onClose={() => setShowForm(false)} />}
+      {editTask   && <TaskForm initial={editTask}  onSave={saveEdit} onClose={() => setEditTask(null)} isEdit />}
+      {showReview && <EndOfDayReview tasks={tasks} onClose={() => setShowReview(false)} onDecide={handleReviewDecide} onClassifyInbox={handleClassifyInbox} />}
+      {showTrash  && <TrashModal trash={trash} attTrash={attTrash} onClose={() => setShowTrash(false)} onRestore={restoreFromTrash} onDeleteOne={deleteFromTrash} onRestoreAtt={restoreAttachment} onDeleteAtt={deleteAttachment} onEmpty={emptyTrash} />}
+    </div>
+    </ThemeCtx.Provider>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
