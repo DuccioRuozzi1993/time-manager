@@ -36,13 +36,17 @@ const LS_LAST_EXPORT = "tm_v1_last_export";
 const LS_EVENT_LOG   = "tm_v1_events";
 const MAX_EVENTS     = 300;
 
+// ── localStorage helpers ──
+const lsRead  = (key, fallback, json = false) => {
+  try { const v = localStorage.getItem(key); return json ? (v ? JSON.parse(v) : fallback) : (v ?? fallback); } catch { return fallback; }
+};
+const lsWrite = (key, value, json = false) => {
+  try { localStorage.setItem(key, json ? JSON.stringify(value) : String(value)); } catch {}
+};
+
 // ── Event log helpers ──
-function readEventLog() {
-  try { const r = localStorage.getItem(LS_EVENT_LOG); return r ? JSON.parse(r) : []; } catch { return []; }
-}
-function writeEventLog(events) {
-  try { localStorage.setItem(LS_EVENT_LOG, JSON.stringify(events.slice(-MAX_EVENTS))); } catch {}
-}
+function readEventLog()        { return lsRead(LS_EVENT_LOG, [], true); }
+function writeEventLog(events) { lsWrite(LS_EVENT_LOG, events.slice(-MAX_EVENTS), true); }
 function appendEvent(type, taskId, meta) {
   const events = readEventLog();
   events.push({ type, taskId, date: today, ...(meta || {}) });
@@ -55,9 +59,9 @@ const IDB_STORE = "attachments";
 
 function openDB() {
   return new Promise(function(resolve, reject) {
-    var req = indexedDB.open(IDB_NAME, 1);
+    const req = indexedDB.open(IDB_NAME, 1);
     req.onupgradeneeded = function(e) {
-      var db = e.target.result;
+      const db = e.target.result;
       if (!db.objectStoreNames.contains(IDB_STORE))
         db.createObjectStore(IDB_STORE, { keyPath:"id" });
     };
@@ -69,7 +73,7 @@ function openDB() {
 function idbSave(record) {
   return openDB().then(function(db) {
     return new Promise(function(resolve, reject) {
-      var tx = db.transaction(IDB_STORE, "readwrite");
+      const tx = db.transaction(IDB_STORE, "readwrite");
       tx.objectStore(IDB_STORE).put(record);
       tx.oncomplete = function() { resolve(); };
       tx.onerror    = function(e) { reject(e.target.error); };
@@ -80,8 +84,8 @@ function idbSave(record) {
 function idbGet(id) {
   return openDB().then(function(db) {
     return new Promise(function(resolve, reject) {
-      var tx  = db.transaction(IDB_STORE, "readonly");
-      var req = tx.objectStore(IDB_STORE).get(id);
+      const tx  = db.transaction(IDB_STORE, "readonly");
+      const req = tx.objectStore(IDB_STORE).get(id);
       req.onsuccess = function(e) { resolve(e.target.result); };
       req.onerror   = function(e) { reject(e.target.error); };
     });
@@ -91,7 +95,7 @@ function idbGet(id) {
 function idbDelete(id) {
   return openDB().then(function(db) {
     return new Promise(function(resolve, reject) {
-      var tx = db.transaction(IDB_STORE, "readwrite");
+      const tx = db.transaction(IDB_STORE, "readwrite");
       tx.objectStore(IDB_STORE).delete(id);
       tx.oncomplete = function() { resolve(); };
       tx.onerror    = function(e) { reject(e.target.error); };
@@ -158,6 +162,46 @@ const maxHz   = (a,b) => RANK[a]>RANK[b]?a:b;
 
 const today   = new Date().toISOString().split("T")[0];
 const T       = n => { const d=new Date(); d.setDate(d.getDate()+n); return d.toISOString().split("T")[0]; };
+
+// ── Temporal subtitles for section headers ──
+function getSectionSubtitle(hz) {
+  const now  = new Date();
+  const _day = new Intl.DateTimeFormat("it-IT", { weekday:"long" });
+  const _md  = new Intl.DateTimeFormat("it-IT", { day:"numeric", month:"short" });
+  const _m   = new Intl.DateTimeFormat("it-IT", { month:"short" });
+
+  if (hz === "today") {
+    const wd = _day.format(now);
+    const dm = _md.format(now).replace(".", "");
+    return wd.charAt(0).toUpperCase() + wd.slice(1) + " " + dm;
+  }
+  if (hz === "week") {
+    // Mon–Fri of current week
+    const day = now.getDay(); // 0=Sun
+    const diffMon = day === 0 ? -6 : 1 - day;
+    const mon = new Date(now); mon.setDate(now.getDate() + diffMon);
+    const fri = new Date(mon); fri.setDate(mon.getDate() + 4);
+    const dMon = mon.getDate();
+    const dFri = fri.getDate();
+    const mMon = _m.format(mon).replace(".", "");
+    const mFri = _m.format(fri).replace(".", "");
+    return mMon === mFri
+      ? `${dMon}–${dFri} ${mMon}`
+      : `${dMon} ${mMon} – ${dFri} ${mFri}`;
+  }
+  if (hz === "month") {
+    // Start of next week → end of 4 weeks from now
+    const day = now.getDay();
+    const diffMon = day === 0 ? 1 : 8 - day;
+    const start = new Date(now); start.setDate(now.getDate() + diffMon);
+    const end   = new Date(now); end.setDate(now.getDate() + 28);
+    const mStart = _m.format(start).replace(".", "");
+    const mEnd   = _m.format(end).replace(".", "");
+    return mStart === mEnd ? mStart.charAt(0).toUpperCase() + mStart.slice(1)
+      : (mStart.charAt(0).toUpperCase() + mStart.slice(1)) + " – " + mEnd;
+  }
+  return null;
+}
 
 function workDiff(a, b) {
   const start = new Date(a < b ? a : b);
@@ -343,11 +387,12 @@ function normalizeTask(raw) {
 
 // ── Shared style helpers ──
 const inp  = (C, ex={}) => ({ width:"100%", background:C.s2, border:"none", borderRadius:10, padding:"11px 14px", color:C.l1, fontSize:15, outline:"none", boxSizing:"border-box", colorScheme: C === LIGHT ? "light" : "dark", fontFamily:"inherit", ...ex });
-const slbl = C => ({ fontSize:13, color:C.l2, fontWeight:500, display:"block", marginBottom:6 });
-const btn  = (C, extra={}) => ({ border:"none", borderRadius:8, cursor:"pointer", fontFamily:"inherit", ...extra });
-const pill = (color, extra={}) => ({ fontSize:11, fontWeight:600, padding:"2px 7px", borderRadius:6, background:color+"22", color, display:"inline-flex", alignItems:"center", gap:3, ...extra });
-const card = (C, extra={}) => ({ background:C.s1, borderRadius:16, overflow:"hidden", boxShadow:C.shadow, ...extra });
+const slbl = C => ({ fontSize:13, color:C.l2, fontWeight:500, display:"block", marginBottom:8});
+const btn  = (C, extra={}) => ({ border:"none", borderRadius:10, cursor:"pointer", fontFamily:"inherit", fontWeight:600, transition:"all 0.15s", ...extra });
+const pill = (color, extra={}) => ({ fontSize:11, fontWeight:600, padding:"2px 7px", borderRadius:6, background:color+"22", color, display:"inline-flex", alignItems:"center", gap:4, ...extra });
+const card = (C, extra={}) => ({ background:C.s1, borderRadius:14, overflow:"hidden", boxShadow:C.shadow, ...extra });
 
+// ── Sheet — modal backdrop + card ──
 function Sheet({ onClose, children, width=480 }) {
   const C = useContext(ThemeCtx);
   return (
@@ -357,6 +402,20 @@ function Sheet({ onClose, children, width=480 }) {
       </div>
     </div>
   );
+}
+
+// ── useHover / HoverDiv / HoverBtn — declarative hover without DOM mutations ──
+function useHover() {
+  const [hovered, setHovered] = useState(false);
+  return [hovered, { onMouseEnter: () => setHovered(true), onMouseLeave: () => setHovered(false) }];
+}
+function HoverDiv({ hoverStyle={}, style, children, ...props }) {
+  const [hovered, handlers] = useHover();
+  return <div style={{ ...style, ...(hovered ? hoverStyle : {}) }} {...handlers} {...props}>{children}</div>;
+}
+function HoverBtn({ hoverStyle={}, style, children, ...props }) {
+  const [hovered, handlers] = useHover();
+  return <button style={{ ...style, ...(hovered ? hoverStyle : {}) }} {...handlers} {...props}>{children}</button>;
 }
 
 // ── Icon — outline SVG icons, same register as sun/moon ──
@@ -424,7 +483,7 @@ function TemplatesModal({ templates, onClose, onSave }) {
 
   return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.55)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px", width:520, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"24px", width:520, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
 
         {/* Header */}
         <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:20, flexShrink:0 }}>
@@ -436,7 +495,7 @@ function TemplatesModal({ templates, onClose, onSave }) {
         </div>
 
         {/* New template input */}
-        <div style={{ display:"flex", gap:8, marginBottom:18, flexShrink:0 }}>
+        <div style={{ display:"flex", gap:8, marginBottom:16, flexShrink:0 }}>
           <input style={inp(C, { flex:1 })} value={newTplName} placeholder="Nome nuovo modello…"
             onChange={e => setNewTplName(e.target.value)}
             onKeyDown={e => e.key === "Enter" && addTemplate()} />
@@ -453,7 +512,7 @@ function TemplatesModal({ templates, onClose, onSave }) {
             <div key={tpl.id} style={{ background:C.s2, borderRadius:14, padding:"14px 16px" }}>
 
               {/* Template name row */}
-              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10 }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8}}>
                 {editingId === tpl.id ? (
                   <input autoFocus value={editingName} onChange={e => setEditingName(e.target.value)}
                     onKeyDown={e => { if (e.key === "Enter") commitRename(tpl.id); if (e.key === "Escape") setEditingId(null); }}
@@ -463,10 +522,9 @@ function TemplatesModal({ templates, onClose, onSave }) {
                   <span onClick={() => startRename(tpl)} title="Clicca per rinominare"
                     style={{ flex:1, fontSize:14, fontWeight:700, color:C.l1, cursor:"text" }}>{tpl.name}</span>
                 )}
-                <button onClick={() => setConfirm(tpl.id)}
+                <HoverBtn onClick={() => setConfirm(tpl.id)}
                   style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:12, opacity:0.5, fontFamily:"inherit", padding:"2px 6px" }}
-                  onMouseEnter={e => e.currentTarget.style.opacity="1"}
-                  onMouseLeave={e => e.currentTarget.style.opacity="0.5"}>Elimina</button>
+                  hoverStyle={{ opacity:1 }}>Elimina</HoverBtn>
               </div>
 
               {/* Subtasks */}
@@ -486,24 +544,23 @@ function TemplatesModal({ templates, onClose, onSave }) {
                           title="Clicca per modificare"
                           style={{ flex:1, fontSize:13, color:C.l1, cursor:"text" }}>{s.label}</span>
                       )}
-                      <button onClick={() => delSub(tpl.id, s.id)}
-                        style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:16, opacity:0.4, padding:0, lineHeight:1 }}
-                        onMouseEnter={e => e.currentTarget.style.opacity="1"}
-                        onMouseLeave={e => e.currentTarget.style.opacity="0.4"}>−</button>
+                      <HoverBtn onClick={() => delSub(tpl.id, s.id)}
+                        style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:15, opacity:0.4, padding:0, lineHeight:1 }}
+                        hoverStyle={{ opacity:1 }}>−</HoverBtn>
                     </div>
                   ))}
                 </div>
               )}
 
               {/* Add subtask to template */}
-              <div style={{ display:"flex", gap:6 }}>
+              <div style={{ display:"flex", gap:8}}>
                 <input style={inp(C, { flex:1, fontSize:12, padding:"7px 10px" })}
                   value={newSubIn[tpl.id] || ""}
                   placeholder="Aggiungi voce al modello…"
                   onChange={e => setNewSubIn(s => ({ ...s, [tpl.id]: e.target.value }))}
                   onKeyDown={e => e.key === "Enter" && addSub(tpl.id)} />
                 <button onClick={() => addSub(tpl.id)}
-                  style={{ background:C.s3, border:"none", color:C.blue, borderRadius:8, width:32, cursor:"pointer", fontSize:18, flexShrink:0 }}>+</button>
+                  style={{ background:C.s3, border:"none", color:C.blue, borderRadius:10, width:32, cursor:"pointer", fontSize:17, flexShrink:0 }}>+</button>
               </div>
 
             </div>
@@ -512,11 +569,11 @@ function TemplatesModal({ templates, onClose, onSave }) {
 
         {/* Confirm delete */}
         {confirm && (
-          <div style={{ marginTop:14, background:`${C.red}12`, borderRadius:12, padding:"12px 14px", display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexShrink:0 }}>
+          <div style={{ marginTop:16, background:`${C.red}12`, borderRadius:14, padding:"12px 14px", display:"flex", alignItems:"center", justifyContent:"space-between", gap:12, flexShrink:0 }}>
             <span style={{ fontSize:13, color:C.l2 }}>Eliminare questo modello?</span>
             <div style={{ display:"flex", gap:8 }}>
-              <button onClick={() => setConfirm(null)} style={{ fontSize:12, color:C.l3, background:C.s3, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontFamily:"inherit" }}>Annulla</button>
-              <button onClick={() => deleteTemplate(confirm)} style={{ fontSize:12, color:"#fff", background:C.red, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>Elimina</button>
+              <button onClick={() => setConfirm(null)} style={{ fontSize:12, color:C.l3, background:C.s3, border:"none", borderRadius:10, padding:"5px 12px", cursor:"pointer", fontFamily:"inherit" }}>Annulla</button>
+              <button onClick={() => deleteTemplate(confirm)} style={{ fontSize:12, color:"#fff", background:C.red, border:"none", borderRadius:10, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>Elimina</button>
             </div>
           </div>
         )}
@@ -535,8 +592,26 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
   const [showTplPicker, setShowTplPicker] = useState(false);
   const [saveTplName, setSaveTplName]     = useState("");
   const [showSaveTpl, setShowSaveTpl]     = useState(false);
+
+  // Progressive disclosure — auto-expand if editing or any secondary field is set
+  const hasSecondaryData = !!(initial.end || initial.start || initial.recurrence ||
+    (initial.subtasks && initial.subtasks.length > 0) || initial.description ||
+    initial.waiting || initial.duration !== "quick");
+  const [showAdvanced, setShowAdvanced] = useState(isEdit || hasSecondaryData);
+
   const set = (k,v) => setForm(f => ({ ...f, [k]:v }));
   const ok  = form.title.trim() && (form.type === "inbox" || form.urgency !== null);
+
+  // Count of active secondary fields (for badge when collapsed)
+  const advancedCount = [
+    !!form.end,
+    !!form.start,
+    !!form.recurrence,
+    form.subtasks.length > 0,
+    !!form.description,
+    form.waiting,
+    form.duration !== "quick",
+  ].filter(Boolean).length;
 
   const handleSave = () => {
     if (!ok) return;
@@ -559,7 +634,7 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
       {/* Header */}
       <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20 }}>
         <div style={{ fontSize:17, fontWeight:700, color:C.l1 }}>{isEdit ? "Modifica task" : "Nuovo task"}</div>
-        <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>✕</button>
+        <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>✕</button>
       </div>
 
       {/* Title */}
@@ -578,35 +653,34 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
         </div>
         <div style={{ display:"flex", paddingLeft:44, marginBottom:4 }}>
           {["Non urgente","Urgente"].map(l => (
-            <div key={l} style={{ flex:1, textAlign:"center", fontSize:9, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</div>
+            <div key={l} style={{ flex:1, textAlign:"center", fontSize:11, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</div>
           ))}
         </div>
-        <div style={{ display:"flex", gap:5 }}>
+        <div style={{ display:"flex", gap:4}}>
           <div style={{ display:"flex", flexDirection:"column", width:40, gap:4 }}>
             {["Alta","Bassa"].map(l => (
               <div key={l} style={{ flex:1, display:"flex", alignItems:"center", justifyContent:"flex-end", paddingRight:6, minHeight:64 }}>
-                <span style={{ fontSize:9, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</span>
+                <span style={{ fontSize:11, color:C.l3, fontWeight:600, letterSpacing:0.7 }}>{l.toUpperCase()}</span>
               </div>
             ))}
           </div>
-          <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", gap:5 }}>
+          <div style={{ flex:1, display:"grid", gridTemplateColumns:"1fr 1fr", gap:4}}>
             {MATRIX.map(c => {
-              var isSel = form.urgency === c.u && form.importance === c.i;
+              const isSel = form.urgency === c.u && form.importance === c.i;
               return (
-                <div key={c.u+""+c.i}
+                <HoverDiv key={c.u+""+c.i}
                   onClick={() => setForm(f => ({ ...f, urgency:c.u, importance:c.i, type: f.type === "inbox" ? "action" : f.type }))}
                   style={{ background:isSel ? c.color+"28" : C.s2, borderRadius:10, padding:"10px 12px", cursor:"pointer", border:"1.5px solid "+(isSel ? c.color : "transparent"), transition:"all 0.15s", minHeight:64, display:"flex", flexDirection:"column", justifyContent:"center", gap:2 }}
-                  onMouseEnter={function(e){ if (!isSel) e.currentTarget.style.background = C.s3; }}
-                  onMouseLeave={function(e){ if (!isSel) e.currentTarget.style.background = C.s2; }}>
+                  hoverStyle={isSel ? {} : { background:C.s3 }}>
                   <div style={{ fontSize:12, fontWeight:700, color:isSel ? c.color : C.l1 }}>{c.label}</div>
-                  <div style={{ fontSize:10, color:C.l3, lineHeight:1.35 }}>{c.sub}</div>
-                </div>
+                  <div style={{ fontSize:11, color:C.l3, lineHeight:1.35 }}>{c.sub}</div>
+                </HoverDiv>
               );
             })}
           </div>
         </div>
         {/* Selected cell hint + inbox escape hatch */}
-        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:7 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginTop:8}}>
           <div>
             {cell && (
               <span style={{ fontSize:11, color:cell.color, fontWeight:500 }}>
@@ -627,10 +701,41 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
 
       {form.type !== "inbox" && (
         <>
+          {/* ── Progressive disclosure toggle ── */}
+          <HoverBtn
+            onClick={() => setShowAdvanced(v => !v)}
+            style={{
+              width:"100%", display:"flex", alignItems:"center", justifyContent:"space-between",
+              background:"none", border:`1px solid ${C.sep}`, borderRadius:10,
+              padding:"9px 14px", cursor:"pointer", fontFamily:"inherit",
+              marginBottom: showAdvanced ? 16 : 20,
+              transition:"background 0.15s, border-color 0.15s",
+            }}
+            hoverStyle={{ background:C.s2, borderColor:C.l3+"50" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8 }}>
+              <span style={{ fontSize:13, fontWeight:500, color: showAdvanced ? C.l2 : C.l1 }}>
+                {showAdvanced ? "Meno opzioni" : "Più opzioni"}
+              </span>
+              {!showAdvanced && advancedCount > 0 && (
+                <span style={{ fontSize:11, fontWeight:700, color:C.blue, background:`${C.blue}18`, borderRadius:10, padding:"1px 7px" }}>
+                  {advancedCount} {advancedCount === 1 ? "impostata" : "impostate"}
+                </span>
+              )}
+            </div>
+            <span style={{ color:C.l3, display:"flex", transition:"transform 0.15s ease-out", transform: showAdvanced ? "rotate(180deg)" : "rotate(0deg)" }}>
+              <svg width="12" height="7" viewBox="0 0 12 7" fill="none"><path d="M1 1L6 6L11 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
+            </span>
+          </HoverBtn>
+
+          {/* ── Secondary fields ── */}
+          {showAdvanced && (
+          <>
+          <div style={{ animation:"advancedIn 0.18s ease" }}>
+
           {/* Duration */}
-          <div style={{ marginBottom:14 }}>
+          <div style={{ marginBottom:16}}>
             <span style={lbl}>Impegno stimato</span>
-            <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
+            <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
               {DURATIONS.filter(function(d){ return ACTION_DURATIONS.indexOf(d.id) >= 0; }).map(d => (
                 <div key={d.id} onClick={() => set("duration", d.id)} style={{ flex:1, padding:"9px 10px", borderRadius:10, background:form.duration === d.id ? `${C.blue}20` : C.s2, border:"1.5px solid "+(form.duration === d.id ? C.blue : "transparent"), cursor:"pointer", textAlign:"center", transition:"all 0.15s" }}>
                   <div style={{ display:"flex", justifyContent:"center", marginBottom:4, color:form.duration === d.id ? C.blue : C.l3 }}><Icon name={d.icon} size={14} color="currentColor" /></div>
@@ -641,22 +746,22 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
           </div>
 
           {/* Dates */}
-          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:10, marginBottom:14 }}>
+          <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:12, marginBottom:16}}>
             <div><span style={lbl}>Inizio <span style={{ color:C.l3, fontWeight:400 }}>(opz.)</span></span><input type="date" style={inp(C)} value={form.start} onChange={e => set("start", e.target.value)} /></div>
             <div><span style={lbl}>Scadenza <span style={{ color:C.l3, fontWeight:400 }}>(opz.)</span></span><input type="date" style={inp(C)} value={form.end} onChange={e => set("end", e.target.value)} /></div>
           </div>
 
           {/* Recurrence */}
-          <div style={{ marginBottom:14 }}>
+          <div style={{ marginBottom:16}}>
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom: form.recurrence ? 8 : 0 }}>
               <span style={{ ...lbl, marginBottom:0 }}>Ricorrenza</span>
               <button onClick={() => set("recurrence", form.recurrence ? null : { freq:"weekly" })}
-                style={{ fontSize:11, color: form.recurrence ? C.blue : C.l3, background: form.recurrence ? `${C.blue}18` : "none", border:`1px solid ${form.recurrence ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                style={{ fontSize:11, color: form.recurrence ? C.blue : C.l3, background: form.recurrence ? `${C.blue}18` : "none", border:`1px solid ${form.recurrence ? `${C.blue}60` : C.sep}`, borderRadius:6, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
                 {form.recurrence ? "✓ Attiva" : "Attiva"}
               </button>
             </div>
             {form.recurrence && (
-              <div style={{ display:"flex", gap:6 }}>
+              <div style={{ display:"flex", gap:8}}>
                 {[
                   { id:"daily",   label:"Ogni giorno" },
                   { id:"weekly",  label:"Ogni settimana" },
@@ -671,14 +776,14 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
               </div>
             )}
             {form.recurrence && !form.end && (
-              <div style={{ fontSize:11, color:C.orange, marginTop:6 }}>⚠ Imposta una scadenza per attivare la ricorrenza.</div>
+              <div style={{ fontSize:11, color:C.orange, marginTop:8}}>⚠ Imposta una scadenza per attivare la ricorrenza.</div>
             )}
           </div>
 
           {/* Color */}
-          <div style={{ marginBottom:14 }}>
+          <div style={{ marginBottom:16}}>
             <span style={lbl}>Colore identità</span>
-            <div style={{ display:"flex", gap:10, alignItems:"center" }}>
+            <div style={{ display:"flex", gap:12, alignItems:"center" }}>
               {PALETTE.slice(0, 7).map(c => (
                 <div key={c} onClick={() => set("color", c)} style={{ width:22, height:22, borderRadius:"50%", background:c, cursor:"pointer", flexShrink:0, boxShadow:form.color === c ? `0 0 0 3px ${C.bg},0 0 0 5px ${c}` : "none", transition:"box-shadow 0.2s" }} />
               ))}
@@ -690,19 +795,19 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
           </div>
 
           {/* Subtasks */}
-          <div style={{ marginBottom:14 }}>
-            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:6 }}>
+          <div style={{ marginBottom:16}}>
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8}}>
               <span style={lbl}>Sotto-attività {form.subtasks.length > 0 && <span style={{ color:C.l3, fontWeight:400 }}>({form.subtasks.length})</span>}</span>
-              <div style={{ display:"flex", gap:6 }}>
+              <div style={{ display:"flex", gap:8}}>
                 {templates.length > 0 && (
                   <button onClick={() => setShowTplPicker(p => !p)}
-                    style={{ fontSize:11, color: showTplPicker ? C.blue : C.l3, background: showTplPicker ? `${C.blue}18` : "none", border:`1px solid ${showTplPicker ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                    style={{ fontSize:11, color: showTplPicker ? C.blue : C.l3, background: showTplPicker ? `${C.blue}18` : "none", border:`1px solid ${showTplPicker ? `${C.blue}60` : C.sep}`, borderRadius:6, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
                     Da modello ↓
                   </button>
                 )}
                 {form.subtasks.length > 0 && onSaveTemplate && (
                   <button onClick={() => setShowSaveTpl(p => !p)}
-                    style={{ fontSize:11, color: showSaveTpl ? C.blue : C.l3, background: showSaveTpl ? `${C.blue}18` : "none", border:`1px solid ${showSaveTpl ? `${C.blue}60` : C.sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
+                    style={{ fontSize:11, color: showSaveTpl ? C.blue : C.l3, background: showSaveTpl ? `${C.blue}18` : "none", border:`1px solid ${showSaveTpl ? `${C.blue}60` : C.sep}`, borderRadius:6, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit", fontWeight:500, transition:"all 0.15s" }}>
                     Salva modello
                   </button>
                 )}
@@ -711,28 +816,27 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
 
             {/* Template picker */}
             {showTplPicker && (
-              <div style={{ background:C.s2, borderRadius:12, padding:"10px", marginBottom:8, display:"flex", flexDirection:"column", gap:5 }}>
+              <div style={{ background:C.s2, borderRadius:14, padding:"10px", marginBottom:8, display:"flex", flexDirection:"column", gap:4}}>
                 <div style={{ fontSize:11, color:C.l3, marginBottom:4, paddingLeft:2 }}>Seleziona un modello da applicare — i sottotask verranno aggiunti a quelli esistenti</div>
                 {templates.map(tpl => (
-                  <button key={tpl.id}
+                  <HoverBtn key={tpl.id}
                     onClick={() => {
                       const newSubs = tpl.subtasks.map(s => ({ ...s, id: Date.now() + Math.random(), done: false }));
                       set("subtasks", [...form.subtasks, ...newSubs]);
                       setShowTplPicker(false);
                     }}
-                    style={{ background:C.s1, border:`1px solid ${C.sep}`, borderRadius:9, padding:"9px 12px", cursor:"pointer", textAlign:"left", fontFamily:"inherit", transition:"all 0.12s" }}
-                    onMouseEnter={e => { e.currentTarget.style.borderColor = C.blue+"60"; e.currentTarget.style.background = C.s3; }}
-                    onMouseLeave={e => { e.currentTarget.style.borderColor = C.sep; e.currentTarget.style.background = C.s1; }}>
+                    style={{ background:C.s1, border:`1px solid ${C.sep}`, borderRadius:10, padding:"9px 12px", cursor:"pointer", textAlign:"left", fontFamily:"inherit", transition:"all 0.15s" }}
+                    hoverStyle={{ borderColor:C.blue+"60", background:C.s3 }}>
                     <div style={{ fontSize:13, fontWeight:600, color:C.l1, marginBottom:2 }}>{tpl.name}</div>
                     <div style={{ fontSize:11, color:C.l3 }}>{tpl.subtasks.length} voc{tpl.subtasks.length === 1 ? "e" : "i"}: {tpl.subtasks.slice(0,3).map(s => s.label).join(" · ")}{tpl.subtasks.length > 3 ? " …" : ""}</div>
-                  </button>
+                  </HoverBtn>
                 ))}
               </div>
             )}
 
             {/* Save as template */}
             {showSaveTpl && (
-              <div style={{ background:`${C.blue}10`, border:`1px solid ${C.blue}30`, borderRadius:12, padding:"10px 12px", marginBottom:8, display:"flex", gap:8, alignItems:"center" }}>
+              <div style={{ background:`${C.blue}10`, border:`1px solid ${C.blue}30`, borderRadius:14, padding:"10px 12px", marginBottom:8, display:"flex", gap:8, alignItems:"center" }}>
                 <input style={inp(C, { flex:1, fontSize:12, padding:"7px 10px" })}
                   value={saveTplName} placeholder="Nome del modello…"
                   autoFocus
@@ -749,7 +853,7 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
                     const n = saveTplName.trim();
                     if (n) { onSaveTemplate({ id:Date.now(), name:n, subtasks: form.subtasks.map(s => ({ id:Date.now()+Math.random(), label:s.label })) }); setSaveTplName(""); setShowSaveTpl(false); }
                   }}
-                  style={{ background:C.blue, border:"none", color:"#fff", borderRadius:8, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:600, fontFamily:"inherit", flexShrink:0 }}>
+                  style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:600, fontFamily:"inherit", flexShrink:0 }}>
                   Salva
                 </button>
               </div>
@@ -760,10 +864,10 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
               <button onClick={addSubField} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, width:42, cursor:"pointer", fontSize:20, fontWeight:300, flexShrink:0 }}>+</button>
             </div>
             {form.subtasks.length > 0 && (
-              <div style={{ background:C.s2, borderRadius:12, overflow:"hidden" }}>
+              <div style={{ background:C.s2, borderRadius:14, overflow:"hidden" }}>
                 {form.subtasks.map(function(s, idx) {
                   return (
-                    <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"10px 14px", borderBottom:idx < form.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:10 }}>
+                    <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"10px 14px", borderBottom:idx < form.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:12}}>
                       {editingSub && editingSub.id === s.id ? (
                         <input
                           autoFocus
@@ -792,7 +896,7 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
                           {s.label}
                         </span>
                       )}
-                      <button onClick={() => set("subtasks", form.subtasks.filter(function(x){ return x.id !== s.id; }))} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, opacity:0.7, padding:0 }}>−</button>
+                      <button onClick={() => set("subtasks", form.subtasks.filter(function(x){ return x.id !== s.id; }))} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:17, opacity:0.7, padding:0 }}>−</button>
                     </div>
                   );
                 })}
@@ -801,35 +905,39 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
           </div>
 
           {/* Notes */}
-          <div style={{ marginBottom:14 }}>
+          <div style={{ marginBottom:16}}>
             <span style={lbl}>Note</span>
             <input style={inp(C)} value={form.description} placeholder="Contesto, link, riferimenti…" onChange={e => set("description", e.target.value)} />
           </div>
 
           {/* Waiting */}
-          <div style={{ marginBottom:18, background:form.waiting ? `${C.teal}12` : C.s2, borderRadius:12, padding:"12px 14px", border:"1.5px solid "+(form.waiting ? `${C.teal}50` : "transparent"), transition:"all 0.2s" }}>
+          <div style={{ marginBottom:16, background:form.waiting ? `${C.teal}12` : C.s2, borderRadius:14, padding:"12px 14px", border:"1.5px solid "+(form.waiting ? `${C.teal}50` : "transparent"), transition:"all 0.15s" }}>
             <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:form.waiting ? 10 : 0 }}>
               <div>
-                <div style={{ display:"flex", alignItems:"center", gap:6, color:form.waiting ? C.teal : C.l1 }}>
+                <div style={{ display:"flex", alignItems:"center", gap:8, color:form.waiting ? C.teal : C.l1 }}>
                   <Icon name="pause" size={13} color="currentColor"/>
                   <div style={{ fontSize:13, fontWeight:600 }}>In attesa di qualcuno</div>
                 </div>
                 <div style={{ fontSize:11, color:C.l3, marginTop:2 }}>Non dipende da te — tocca ad altri muoversi</div>
               </div>
               <div onClick={() => setForm(f => ({ ...f, waiting:!f.waiting, waitingSince:!f.waiting ? today : "" }))}
-                style={{ width:40, height:24, borderRadius:12, background:form.waiting ? C.teal : C.s3, cursor:"pointer", position:"relative", transition:"background 0.2s", flexShrink:0 }}>
-                <div style={{ width:18, height:18, borderRadius:"50%", background:"#fff", position:"absolute", top:3, left:form.waiting ? 19 : 3, transition:"left 0.2s", boxShadow:"0 1px 3px rgba(0,0,0,0.3)" }} />
+                style={{ width:40, height:24, borderRadius:14, background:form.waiting ? C.teal : C.s3, cursor:"pointer", position:"relative", transition:"background 0.15s", flexShrink:0 }}>
+                <div style={{ width:18, height:18, borderRadius:"50%", background:"#fff", position:"absolute", top:3, left:form.waiting ? 19 : 3, transition:"left 0.15s ease-out", boxShadow:"0 1px 3px rgba(0,0,0,0.3)" }} />
               </div>
             </div>
             {form.waiting && (
               <input style={inp(C, { fontSize:13, padding:"9px 12px" })} value={form.waitingFor} placeholder="Chi? Es. Marco, Studio legale, Cliente X…" onChange={e => set("waitingFor", e.target.value)} />
             )}
           </div>
+
+          </div> {/* end animation wrapper */}
+          </>
+          )}
         </>
       )}
 
       {/* Save */}
-      <button onClick={handleSave} style={{ width:"100%", padding:"13px", borderRadius:12, border:"none", background:ok ? C.blue : C.s3, color:ok ? "#fff" : C.l3, cursor:ok ? "pointer" : "default", fontSize:15, fontWeight:600, transition:"all 0.2s" }}>
+      <button onClick={handleSave} style={{ width:"100%", padding:"13px", borderRadius:14, border:"none", background:ok ? C.blue : C.s3, color:ok ? "#fff" : C.l3, cursor:ok ? "pointer" : "default", fontSize:15, fontWeight:600, transition:"all 0.15s" }}>
         {isEdit ? "Salva modifiche" : "Aggiungi task"}
       </button>
 
@@ -840,13 +948,11 @@ function TaskForm({ initial, onSave, onClose, isEdit=false, templates=[], onSave
 function SuggestionWhisper({ suggestions, onAction }) {
   const C = useContext(ThemeCtx);
   const [idx, setIdx] = useState(0);
-  const [dismissed, setDismissed] = useState(() => {
-    try { return localStorage.getItem("tm_v1_whisper_dismissed") === today; } catch { return false; }
-  });
+  const [dismissed, setDismissed] = useState(() => lsRead("tm_v1_whisper_dismissed", null) === today);
   const [localDismissed, setLocalDismissed] = useState([]);
 
   function dismiss() {
-    try { localStorage.setItem("tm_v1_whisper_dismissed", today); } catch {}
+    lsWrite("tm_v1_whisper_dismissed", today);
     setDismissed(true);
   }
 
@@ -861,21 +967,21 @@ function SuggestionWhisper({ suggestions, onAction }) {
   }
 
   return (
-    <div style={{ background:C.s1, borderRadius:12, padding:"11px 14px", marginBottom:16, display:"flex", alignItems:"flex-start", gap:12, border:`1px solid ${C.sep}` }}>
+    <div style={{ background:C.s1, borderRadius:14, padding:"11px 14px", marginBottom:16, display:"flex", alignItems:"flex-start", gap:12, border:`1px solid ${C.sep}` }}>
       <span style={{ display:"flex", alignItems:"center", flexShrink:0, color: s.icon === "warning" ? C.orange : C.l3, marginTop:1 }}><Icon name={s.icon} size={14} color="currentColor"/></span>
       <div style={{ flex:1, minWidth:0 }}>
         <span style={{ fontSize:13, color:C.l2, lineHeight:1.45 }}>{s.text}</span>
         {(s.action || s.action2) && (
-          <div style={{ display:"flex", gap:6, marginTop:8 }}>
+          <div style={{ display:"flex", gap:8, marginTop:8 }}>
             {s.action && (
               <button onClick={() => handleAction(s.action)}
-                style={{ fontSize:11, fontWeight:600, color:C.red, background:C.red+"15", border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+                style={{ fontSize:11, fontWeight:600, color:C.red, background:C.red+"15", border:"none", borderRadius:6, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
                 {s.action.label}
               </button>
             )}
             {s.action2 && (
               <button onClick={() => handleAction(s.action2)}
-                style={{ fontSize:11, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+                style={{ fontSize:11, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:6, padding:"4px 10px", cursor:"pointer", fontFamily:"inherit" }}>
                 {s.action2.label}
               </button>
             )}
@@ -885,9 +991,9 @@ function SuggestionWhisper({ suggestions, onAction }) {
       <div style={{ display:"flex", gap:4, alignItems:"center", flexShrink:0 }}>
         {visible.length > 1 && (
           <>
-            <button onClick={() => setIdx(i => (i-1+visible.length)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>‹</button>
+            <button onClick={() => setIdx(i => (i-1+visible.length)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:15, padding:"2px 5px" }}>‹</button>
             <span style={{ fontSize:11, color:C.l3 }}>{Math.min(idx,visible.length-1)+1}/{visible.length}</span>
-            <button onClick={() => setIdx(i => (i+1)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:16, padding:"2px 5px" }}>›</button>
+            <button onClick={() => setIdx(i => (i+1)%visible.length)} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:15, padding:"2px 5px" }}>›</button>
           </>
         )}
         <button onClick={dismiss} style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:14, padding:"2px 8px", marginLeft:4 }}>✕</button>
@@ -914,8 +1020,8 @@ function QuickCapture({ onAdd }) {
 
   return (
     <div style={{ marginBottom:20 }}>
-      <div style={{ display:"flex", gap:10, alignItems:"center", background:flash ? `${C.green}18` : active ? C.s2 : C.s1, borderRadius:12, padding:"11px 16px", border:`1px solid ${flash ? `${C.green}60` : active ? `${C.blue}50` : C.sep}`, transition:"all 0.3s" }}>
-        <span style={{ fontSize:20, color:flash ? C.green : active ? C.blue : C.l3, transition:"color 0.3s", flexShrink:0 }}>{flash ? "✓" : "+"}</span>
+      <div style={{ display:"flex", gap:12, alignItems:"center", background:flash ? `${C.green}18` : active ? C.s2 : C.s1, borderRadius:14, padding:"11px 16px", border:`1px solid ${flash ? `${C.green}60` : active ? `${C.blue}50` : C.sep}`, transition:"all 0.25s ease-out" }}>
+        <span style={{ fontSize:20, color:flash ? C.green : active ? C.blue : C.l3, transition:"color 0.15s", flexShrink:0 }}>{flash ? "✓" : "+"}</span>
         <input
           value={val} onChange={e => setVal(e.target.value)}
           onKeyDown={e => { if (e.key === "Enter") submit(); if (e.key === "Escape") { setVal(""); setActive(false); } }}
@@ -928,17 +1034,17 @@ function QuickCapture({ onAdd }) {
           <>
             <button onClick={() => { setVal(""); setActive(false); }}
               style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:14, padding:"0 2px", flexShrink:0, lineHeight:1 }}>✕</button>
-            <button onClick={submit} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:8, padding:"4px 12px", cursor:"pointer", fontSize:13, fontWeight:600, flexShrink:0 }}>↵</button>
+            <button onClick={submit} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"4px 12px", cursor:"pointer", fontSize:13, fontWeight:600, flexShrink:0 }}>↵</button>
           </>
         )}
       </div>
-      {active && <div style={{ fontSize:11, color:C.l3, marginTop:5, paddingLeft:4 }}>↵ per catturare · Esc per annullare · Classifica dopo in Inbox</div>}
+      {active && <div style={{ fontSize:11, color:C.l3, marginTop:4, paddingLeft:4 }}>↵ per catturare · Esc per annullare · Classifica dopo in Inbox</div>}
     </div>
   );
 }
 
 // ── Snooze picker popup ──
-function SnoozePickerPopup({ onSnooze, onClose }) {
+function SnoozePickerPopup({ anchorRect, onSnooze, onClose }) {
   const C = useContext(ThemeCtx);
   const [custom, setCustom] = useState("");
 
@@ -977,29 +1083,62 @@ function SnoozePickerPopup({ onSnooze, onClose }) {
     onSnooze(d.getTime());
   }
 
-  return (
-    <div onClick={e => e.stopPropagation()}
-      style={{ position:"absolute", right:0, top:"calc(100% + 6px)", zIndex:100, background:C.s1, border:"1px solid "+C.sep, borderRadius:14, padding:"14px 16px", boxShadow:"0 8px 32px rgba(0,0,0,0.22)", minWidth:220 }}>
-      <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.8, marginBottom:10 }}>RIMANDA ALLE</div>
-      <div style={{ display:"flex", flexWrap:"wrap", gap:6, marginBottom:12 }}>
+  // Close on outside click or Escape
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    function onOutside(e) {
+      if (popupRef.current && !popupRef.current.contains(e.target)) onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onOutside);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onOutside);
+    };
+  }, []);
+
+  const popupRef = useRef(null);
+
+  // Calculate fixed position from anchor rect
+  const POPUP_H = 180; // approximate
+  const POPUP_W = 240;
+  const spaceBelow = anchorRect ? window.innerHeight - anchorRect.bottom : 999;
+  const flipUp = spaceBelow < POPUP_H + 20;
+
+  const fixedStyle = anchorRect ? {
+    position:  "fixed",
+    right:     Math.max(8, window.innerWidth - anchorRect.right),
+    ...(flipUp
+      ? { bottom: window.innerHeight - anchorRect.top + 6 }
+      : { top:    anchorRect.bottom + 6 }),
+    zIndex: 2000,
+  } : { position:"fixed", top:0, right:0, zIndex:2000 };
+
+  const popup = (
+    <div ref={popupRef} onClick={e => e.stopPropagation()}
+      style={{ ...fixedStyle, background:C.s1, border:"1px solid "+C.sep, borderRadius:14, padding:"14px 16px", boxShadow:"0 8px 32px rgba(0,0,0,0.30)", minWidth:POPUP_W }}>
+      <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5, marginBottom:8}}>RIMANDA ALLE</div>
+      <div style={{ display:"flex", flexWrap:"wrap", gap:8, marginBottom:12 }}>
         {chips.map(c => (
           <button key={c.value} onClick={() => onSnooze(c.ts)}
-            style={{ fontSize:12, fontWeight:600, color:C.l1, background:C.s2, border:"1px solid "+C.sep, borderRadius:8, padding:"5px 10px", cursor:"pointer", fontFamily:"inherit", whiteSpace:"nowrap" }}>
+            style={{ fontSize:12, fontWeight:600, color:C.l1, background:C.s2, border:"1px solid "+C.sep, borderRadius:10, padding:"5px 10px", cursor:"pointer", fontFamily:"inherit", whiteSpace:"nowrap" }}>
             {c.label}
           </button>
         ))}
       </div>
-      <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-        <input value={custom} onChange={e => setCustom(e.target.value)} placeholder="HH:MM"
+      <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+        <input autoFocus value={custom} onChange={e => setCustom(e.target.value)} placeholder="HH:MM"
           onKeyDown={e => { if (e.key === "Enter") handleCustom(); if (e.key === "Escape") onClose(); }}
-          style={{ flex:1, fontSize:13, color:C.l1, background:C.s2, border:"1px solid "+C.sep, borderRadius:8, padding:"6px 10px", outline:"none", fontFamily:"inherit" }} />
+          style={{ flex:1, fontSize:13, color:C.l1, background:C.s2, border:"1px solid "+C.sep, borderRadius:10, padding:"6px 10px", outline:"none", fontFamily:"inherit" }} />
         <button onClick={handleCustom}
-          style={{ fontSize:12, fontWeight:700, color:"#fff", background:C.blue, border:"none", borderRadius:8, padding:"6px 12px", cursor:"pointer", fontFamily:"inherit" }}>
+          style={{ fontSize:12, fontWeight:700, color:"#fff", background:C.blue, border:"none", borderRadius:10, padding:"6px 12px", cursor:"pointer", fontFamily:"inherit" }}>
           OK
         </button>
       </div>
     </div>
   );
+
+  return ReactDOM.createPortal(popup, document.body);
 }
 
 function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePin, onSnooze }) {
@@ -1013,29 +1152,29 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
   const dur      = DURATION_MAP[task.duration];
   const isInbox  = task.type === "inbox";
   const [showSnooze, setShowSnooze] = useState(false);
+  const snoozeRef = useRef(null);
   const isReturned = task.snoozedUntil && task.snoozedUntil <= Date.now();
 
   return (
     <div style={{ position:"relative" }}>
       <div className="agenda-row" onClick={onSelect}
-        style={{ display:"flex", alignItems:"stretch", cursor:"pointer", background:isSelected ? C.s2 : "transparent", transition:"background 0.12s", outline: isReturned ? "2px solid "+C.teal+"80" : "none", outlineOffset:-2, borderRadius: isReturned ? 8 : 0 }}>
+        style={{ display:"flex", alignItems:"stretch", cursor:"pointer", background:isSelected ? C.s2 : "transparent", transition:"background 0.15s", outline: isReturned ? "2px solid "+C.teal+"80" : "none", outlineOffset:-2, borderRadius: isReturned ? 8 : 0 }}>
         <div style={{ width:4, background:isInbox ? C.l3 : hzColor, flexShrink:0, borderRadius:"4px 0 0 4px", opacity:isInbox ? 0.2 : 1 }} />
-        <div style={{ flex:1, display:"flex", alignItems:"center", padding:"10px 14px 10px 13px", gap:10 }}>
+        <div style={{ flex:1, display:"flex", alignItems:"center", padding:"10px 14px 10px 13px", gap:12}}>
 
           {/* Completion circle */}
-          <div onClick={e => { e.stopPropagation(); onComplete(task.id); }}
+          <HoverDiv onClick={e => { e.stopPropagation(); onComplete(task.id); }}
             title="Segna come completato"
             style={{ width:18, height:18, borderRadius:"50%", flexShrink:0, border:`1.5px solid ${isInbox ? C.l3 : hzColor}`, background:"transparent", display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity: isInbox ? 0.3 : 0.45, transition:"all 0.15s" }}
-            onMouseEnter={e => { e.currentTarget.style.opacity="1"; e.currentTarget.style.background=hzColor+"30"; }}
-            onMouseLeave={e => { e.currentTarget.style.opacity= isInbox ? "0.3" : "0.45"; e.currentTarget.style.background="transparent"; }}>
+            hoverStyle={{ opacity:1, background:hzColor+"30" }}>
             <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke={isInbox ? C.l3 : hzColor} strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>
-          </div>
+          </HoverDiv>
 
           {/* Identity dot */}
           <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
 
           <div style={{ flex:1, minWidth:0 }}>
-            <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom: task.description ? 2 : 3, flexWrap:"wrap" }}>
+            <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom: task.description ? 2 : 3, flexWrap:"wrap" }}>
               <span style={{ fontSize:15, fontWeight:600, color:isInbox ? C.l2 : task.waiting ? C.l2 : C.l1 }}>{task.title}</span>
               {task.recurrence && (
                 <span title={`Ricorrente · ${task.recurrence.freq === "daily" ? "ogni giorno" : task.recurrence.freq === "weekly" ? "ogni settimana" : "ogni mese"}`} style={{ display:"inline-flex", alignItems:"center", color:C.l3, opacity:0.6 }}>
@@ -1045,17 +1184,17 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
                   </svg>
                 </span>
               )}
-              {isInbox && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>}
-              {task.waiting && <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.teal}22`, color:C.teal, display:"inline-flex", alignItems:"center", gap:3 }}><Icon name="pause" size={9} color="currentColor"/>in attesa</span>}
+              {isInbox && <span style={{ fontSize:11, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>}
+              {task.waiting && <span style={{ fontSize:11, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.teal}22`, color:C.teal, display:"inline-flex", alignItems:"center", gap:4}}><Icon name="pause" size={11} color="currentColor"/>in attesa</span>}
               {isReturned && (
-                <span style={{ fontSize:10, fontWeight:700, padding:"2px 7px", borderRadius:6, background:C.teal+"22", color:C.teal, display:"inline-flex", alignItems:"center", gap:3 }}>
+                <span style={{ fontSize:11, fontWeight:700, padding:"2px 7px", borderRadius:6, background:C.teal+"22", color:C.teal, display:"inline-flex", alignItems:"center", gap:4}}>
                   <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>
                   rientrato
                 </span>
               )}
               {escalated && !isInbox && !task.waiting && (
-                <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:(risk && risk.level==="critical") ? `${C.red}2A` : `${C.orange}2A`, color:(risk && risk.level==="critical") ? C.red : C.orange, display:"inline-flex", alignItems:"center", gap:3 }}>
-                  <Icon name="warning" size={9} color="currentColor"/>
+                <span style={{ fontSize:11, fontWeight:600, padding:"2px 6px", borderRadius:6, background:(risk && risk.level==="critical") ? `${C.red}2A` : `${C.orange}2A`, color:(risk && risk.level==="critical") ? C.red : C.orange, display:"inline-flex", alignItems:"center", gap:4}}>
+                  <Icon name="warning" size={11} color="currentColor"/>
                   {(risk && risk.level==="critical") ? "rischio" : "in scadenza"}
                 </span>
               )}
@@ -1067,7 +1206,7 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
               {dur && !isInbox && <span style={{ display:"flex", alignItems:"center", color:C.l3 }}><Icon name={dur.icon} size={11} color="currentColor" /></span>}
               {task.subtasks.length > 0 && <span style={{ fontSize:12, color:C.l3 }}>{doneSubs}/{task.subtasks.length} sottotask</span>}
               {task.attachments && task.attachments.length > 0 && (
-                <span style={{ display:"flex", alignItems:"center", gap:3, fontSize:11, color:C.l3 }}>
+                <span style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.l3 }}>
                   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
                   </svg>
@@ -1080,10 +1219,10 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
           </div>
           {/* Snooze button */}
           {!isInbox && onSnooze && (
-            <div onClick={e => { e.stopPropagation(); setShowSnooze(s => !s); }}
+            <div ref={snoozeRef} onClick={e => { e.stopPropagation(); setShowSnooze(s => !s); }}
               title="Rimanda a più tardi"
               className="pin-btn"
-              style={{ flexShrink:0, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity:showSnooze ? 1 : 0, transition:"opacity 0.15s", color: showSnooze ? C.teal : C.l3 }}>
+              style={{ flexShrink:0, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity:showSnooze ? 1 : 0.3, transition:"opacity 0.15s", color: showSnooze ? C.teal : C.l3 }}>
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
               </svg>
@@ -1094,14 +1233,14 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
             <div onClick={e => { e.stopPropagation(); onTogglePin && onTogglePin(task.id); }}
               title={task.pinned ? "Rimuovi pin" : "Fissa in cima"}
               className="pin-btn"
-              style={{ flexShrink:0, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity: task.pinned ? 1 : 0, transition:"opacity 0.15s", color: task.pinned ? C.blue : C.l3 }}>
+              style={{ flexShrink:0, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", opacity: task.pinned ? 1 : 0.3, transition:"opacity 0.15s", color: task.pinned ? C.blue : C.l3 }}>
               <svg width="11" height="13" viewBox="0 0 16 20" fill={task.pinned ? "currentColor" : "none"} stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
                 <path d="M9 1H7a1 1 0 0 0-1 1v1H4a1 1 0 0 0-.894 1.447L5 8v3a1 1 0 0 0 1 1h4a1 1 0 0 0 1-1V8l1.894-3.553A1 1 0 0 0 12 3h-2V2a1 1 0 0 0-1-1z"/>
                 <line x1="8" y1="12" x2="8" y2="19"/>
               </svg>
             </div>
           )}
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:3, flexShrink:0 }}>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"flex-end", gap:4, flexShrink:0 }}>
             {!isInbox && task.subtasks.length > 0 && <span style={{ fontSize:13, fontWeight:600, color:task.color }}>{task.progress}%</span>}
             {dL !== null && <span style={{ fontSize:11, color:dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
               {dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : dL === 1 ? "Dom." : `${dL}gg lav.`}
@@ -1118,23 +1257,24 @@ function AgendaRow({ task, isSelected, onSelect, onComplete, hzColor, onTogglePi
       {/* Snooze popup */}
       {showSnooze && (
         <SnoozePickerPopup
+          anchorRect={snoozeRef.current ? snoozeRef.current.getBoundingClientRect() : null}
           onSnooze={ts => { onSnooze(task.id, ts); setShowSnooze(false); }}
           onClose={() => setShowSnooze(false)}
         />
       )}
       {nextSub && (
-        <div onClick={onSelect} style={{ display:"flex", alignItems:"center", gap:10, padding:"8px 14px 8px 36px", cursor:"pointer", background:isSelected ? C.s2 : "transparent" }}>
+        <div onClick={onSelect} style={{ display:"flex", alignItems:"center", gap:12, padding:"8px 14px 8px 36px", cursor:"pointer", background:isSelected ? C.s2 : "transparent" }}>
           <div style={{ width:3, background:hzColor, alignSelf:"stretch", borderRadius:3, flexShrink:0 }} />
           <div style={{ width:12, height:12, borderRadius:"50%", border:`1.5px solid ${task.color}`, flexShrink:0 }} />
           <span style={{ fontSize:13, color:C.l2, flex:1 }}>{nextSub.label}</span>
-          <span style={{ fontSize:10, fontWeight:600, padding:"2px 7px", borderRadius:7, background:task.color+"22", color:task.color }}>→ Prossimo</span>
+          <span style={{ fontSize:11, fontWeight:600, padding:"2px 7px", borderRadius:6, background:task.color+"22", color:task.color }}>→ Prossimo</span>
         </div>
       )}
     </div>
   );
 }
 
-function AgendaSection({ items, selected, onSelect, onComplete, label, color, extra, onTogglePin, dayPct, onSnooze }) {
+function AgendaSection({ items, selected, onSelect, onComplete, label, color, extra, onTogglePin, dayPct, onSnooze, subtitle }) {
   const C = useContext(ThemeCtx);
   const [collapsed, setCollapsed] = useState(false);
   if (!items.length) return null;
@@ -1151,12 +1291,13 @@ function AgendaSection({ items, selected, onSelect, onComplete, label, color, ex
           )}
         </div>
       )}
-      <div onClick={() => setCollapsed(c => !c)} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:10, cursor:"pointer", userSelect:"none" }}>
+      <div onClick={() => setCollapsed(c => !c)} style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8, cursor:"pointer", userSelect:"none" }}>
         <div style={{ width:5, height:5, borderRadius:"50%", background:color }} />
-        <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:1.1 }}>{label.toUpperCase()}</span>
+        <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:0.5 }}>{label.toUpperCase()}</span>
+        {subtitle && <span style={{ fontSize:11, color:C.l3, fontWeight:400, letterSpacing:0 }}>· {subtitle}</span>}
         <span style={{ fontSize:12, color:C.l3, fontWeight:500 }}>{items.length}</span>
         {extra && <span style={{ marginLeft:"auto", fontSize:11, color:extra.color, fontWeight:500 }}>{extra.text}</span>}
-        <span style={{ marginLeft:extra ? 0 : "auto", color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.2s", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
+        <span style={{ marginLeft:extra ? 0 : "auto", color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.15s ease-out", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
           <svg width="12" height="7" viewBox="0 0 12 7" fill="none"><path d="M1 1L6 6L11 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </span>
       </div>
@@ -1189,26 +1330,26 @@ function AttachmentViewer({ attachment, onClose }) {
 
   return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.85)", backdropFilter:"blur(24px)", display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:500 }}>
-      <div onClick={e => e.stopPropagation()} style={{ width:"90vw", maxWidth:900, height:"85vh", display:"flex", flexDirection:"column", gap:10 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width:"90vw", maxWidth:900, height:"85vh", display:"flex", flexDirection:"column", gap:12}}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", flexShrink:0 }}>
           <span style={{ fontSize:13, fontWeight:600, color:"rgba(255,255,255,0.8)" }}>{attachment.name}</span>
           <div style={{ display:"flex", gap:8 }}>
             {url && (
               <a href={url} download={attachment.name}
-                style={{ fontSize:12, color:"rgba(255,255,255,0.5)", background:"rgba(255,255,255,0.1)", borderRadius:8, padding:"5px 12px", textDecoration:"none", fontWeight:500 }}>
+                style={{ fontSize:12, color:"rgba(255,255,255,0.5)", background:"rgba(255,255,255,0.1)", borderRadius:10, padding:"5px 12px", textDecoration:"none", fontWeight:500 }}>
                 Scarica
               </a>
             )}
-            <button onClick={onClose} style={{ background:"rgba(255,255,255,0.12)", border:"none", color:"#fff", borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+            <button onClick={onClose} style={{ background:"rgba(255,255,255,0.12)", border:"none", color:"#fff", borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
           </div>
         </div>
         <div style={{ flex:1, borderRadius:14, overflow:"hidden", background:"rgba(255,255,255,0.05)", display:"flex", alignItems:"center", justifyContent:"center" }}>
           {!url ? (
             <span style={{ color:"rgba(255,255,255,0.3)", fontSize:13 }}>Caricamento…</span>
           ) : isImage ? (
-            <img src={url} alt={attachment.name} style={{ maxWidth:"100%", maxHeight:"100%", objectFit:"contain", borderRadius:8 }} />
+            <img src={url} alt={attachment.name} style={{ maxWidth:"100%", maxHeight:"100%", objectFit:"contain", borderRadius:10}} />
           ) : isPDF ? (
-            <iframe src={url} title={attachment.name} style={{ width:"100%", height:"100%", border:"none", borderRadius:8 }} />
+            <iframe src={url} title={attachment.name} style={{ width:"100%", height:"100%", border:"none", borderRadius:10}} />
           ) : (
             <div style={{ textAlign:"center", color:"rgba(255,255,255,0.4)" }}>
               <div style={{ fontSize:36, marginBottom:12 }}><Icon name="archive" size={36} color="currentColor"/></div>
@@ -1256,29 +1397,28 @@ function AttachmentSection({ task, onAdd, onRemove }) {
   return (
     <div style={{ marginBottom:12 }}>
       <input ref={fileRef} type="file" multiple accept="image/*,.pdf,.doc,.docx,.xls,.xlsx,.txt" style={{ display:"none" }} onChange={handleFiles} />
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:7 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8}}>
         <span style={{ fontSize:12, fontWeight:500, color:C.l2 }}>Allegati</span>
         <button onClick={() => fileRef.current.click()}
-          style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"3px 10px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
+          style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:6, padding:"3px 10px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
           {loading ? "…" : <><Icon name="inbox" size={10} color="currentColor"/> Allega</>}
         </button>
       </div>
       {task.attachments.length > 0 && (
         <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
           {task.attachments.map(att => (
-            <div key={att.id} style={{ display:"flex", alignItems:"center", gap:8, background:C.s2, borderRadius:9, padding:"7px 10px" }}>
+            <div key={att.id} style={{ display:"flex", alignItems:"center", gap:8, background:C.s2, borderRadius:10, padding:"7px 10px" }}>
               <span style={{ color:C.l3, flexShrink:0 }}><Icon name={iconFor(att.type)} size={12} color="currentColor"/></span>
               <button onClick={() => setViewing(att)}
                 style={{ flex:1, background:"none", border:"none", textAlign:"left", cursor:"pointer", padding:0, minWidth:0 }}>
                 <div style={{ fontSize:12, fontWeight:500, color:C.l1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{att.name}</div>
-                <div style={{ fontSize:10, color:C.l3 }}>{fmtSize(att.size)}</div>
+                <div style={{ fontSize:11, color:C.l3 }}>{fmtSize(att.size)}</div>
               </button>
-                <button onClick={() => handleRemove(att)}
+                <HoverBtn onClick={() => handleRemove(att)}
                   style={{ background:"none", border:"none", color:C.red, cursor:"pointer", opacity:0.4, padding:"2px 4px", flexShrink:0, fontSize:14, lineHeight:1, fontFamily:"inherit" }}
-                  onMouseEnter={e => e.currentTarget.style.opacity="1"}
-                  onMouseLeave={e => e.currentTarget.style.opacity="0.4"}>
+                  hoverStyle={{ opacity:1 }}>
                   ✕
-                </button>
+                </HoverBtn>
             </div>
           ))}
         </div>
@@ -1314,23 +1454,23 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
 
   return (
     <div style={{ width:300, background:C.s1, borderLeft:`1px solid ${C.sep}`, overflowY:"auto", padding:"20px 18px", animation:"panelIn 0.2s ease", flexShrink:0, display:"flex", flexDirection:"column", boxShadow:C.shadow ? `-4px 0 20px rgba(0,0,0,0.08)` : "none" }}>
-      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:14 }}>
-        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+      <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16}}>
+        <div style={{ display:"flex", alignItems:"center", gap:8}}>
           <div style={{ width:8, height:8, borderRadius:"50%", background:task.color }} />
           {dur && <span style={{ display:"flex", alignItems:"center", gap:4, fontSize:11, color:C.l3 }}><Icon name={dur.icon} size={11} color="currentColor"/>{dur.label}</span>}
         </div>
-        <div style={{ display:"flex", gap:5 }}>
+        <div style={{ display:"flex", gap:4}}>
           {task.type !== "inbox" && !task.waiting && (
-            <button onClick={() => onToggleWaiting(task.id)} title="Metti in attesa" style={{ background:C.s2, border:"none", color:C.l3, borderRadius:8, padding:"5px 8px", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <button onClick={() => onToggleWaiting(task.id)} title="Metti in attesa" style={{ background:C.s2, border:"none", color:C.l3, borderRadius:10, padding:"5px 8px", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><line x1="10" y1="15" x2="10" y2="9"/><line x1="14" y1="15" x2="14" y2="9"/></svg>
             </button>
           )}
-          <button onClick={onEdit} style={{ background:task.type==="inbox" ? `${C.blue}22` : C.s2, border:"none", color:task.type==="inbox" ? C.blue : C.l2, borderRadius:8, padding:"5px 10px", cursor:"pointer", fontSize:12, fontWeight:task.type==="inbox" ? 600 : 500 }}>{task.type === "inbox" ? "Classifica →" : "Modifica"}</button>
-          <button onClick={onClose} style={{ background:C.s2, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+          <button onClick={onEdit} style={{ background:task.type==="inbox" ? `${C.blue}22` : C.s2, border:"none", color:task.type==="inbox" ? C.blue : C.l2, borderRadius:10, padding:"5px 10px", cursor:"pointer", fontSize:12, fontWeight:task.type==="inbox" ? 600 : 500 }}>{task.type === "inbox" ? "Classifica →" : "Modifica"}</button>
+          <button onClick={onClose} style={{ background:C.s2, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
         </div>
       </div>
 
-      <h2 style={{ margin:"0 0 4px", fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3, lineHeight:1.25 }}>{task.title}</h2>
+      <h2 style={{ margin:"0 0 4px", fontSize:17, fontWeight:700, color:C.l1, letterSpacing:-0.3, lineHeight:1.25 }}>{task.title}</h2>
       {task.description && (
         <div style={{ background:C.s2, borderRadius:10, padding:"10px 12px", marginBottom:12, maxHeight:140, overflowY:"auto" }}>
           <p style={{ margin:0, fontSize:13, color:C.l2, lineHeight:1.6, whiteSpace:"pre-wrap", wordBreak:"break-word" }}>{task.description}</p>
@@ -1338,20 +1478,20 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
       )}
 
       {task.waiting && (
-        <div style={{ background:`${C.teal}12`, borderRadius:12, padding:"11px 14px", marginBottom:12, border:`1px solid ${C.teal}30` }}>
+        <div style={{ background:`${C.teal}12`, borderRadius:14, padding:"11px 14px", marginBottom:12, border:`1px solid ${C.teal}30` }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
             <div>
-              <div style={{ display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:700, color:C.teal, marginBottom:3 }}><Icon name="pause" size={11} color="currentColor"/>In attesa</div>
+              <div style={{ display:"flex", alignItems:"center", gap:4, fontSize:12, fontWeight:700, color:C.teal, marginBottom:3 }}><Icon name="pause" size={11} color="currentColor"/>In attesa</div>
               {task.waitingFor && <div style={{ fontSize:12, color:C.l2 }}>↳ {task.waitingFor}</div>}
               {task.waitingSince && <div style={{ fontSize:11, color:C.l3, marginTop:3 }}>da {workDiff(task.waitingSince, today)} gg lav.</div>}
             </div>
-            <button onClick={() => onToggleWaiting(task.id)} style={{ fontSize:11, fontWeight:600, color:C.teal, background:`${C.teal}18`, border:"none", borderRadius:7, padding:"4px 10px", cursor:"pointer" }}>Sbloccato →</button>
+            <button onClick={() => onToggleWaiting(task.id)} style={{ fontSize:11, fontWeight:600, color:C.teal, background:`${C.teal}18`, border:"none", borderRadius:6, padding:"4px 10px", cursor:"pointer" }}>Sbloccato →</button>
           </div>
         </div>
       )}
 
       {task.recurrence && (
-        <div style={{ background:`${C.blue}10`, borderRadius:12, padding:"10px 14px", marginBottom:12, border:`1px solid ${C.blue}28`, display:"flex", alignItems:"center", gap:8 }}>
+        <div style={{ background:`${C.blue}10`, borderRadius:14, padding:"10px 14px", marginBottom:12, border:`1px solid ${C.blue}28`, display:"flex", alignItems:"center", gap:8 }}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink:0 }}>
             <polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/>
             <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
@@ -1365,10 +1505,10 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
         </div>
       )}
 
-      <div style={{ display:"flex", gap:5, flexWrap:"wrap", marginBottom:12 }}>
-        {HZ[compHz] && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:hzColor(compHz,C)+"2A", color:hzColor(compHz,C) }}>{HZ[compHz].label}</span>}
-        {cell && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:cell.color+"2A", color:cell.color }}>{cell.label}</span>}
-        {esc && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, background:`${C.orange}2A`, color:C.orange }}>Escalato</span>}
+      <div style={{ display:"flex", gap:4, flexWrap:"wrap", marginBottom:12 }}>
+        {HZ[compHz] && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:6, background:hzColor(compHz,C)+"2A", color:hzColor(compHz,C) }}>{HZ[compHz].label}</span>}
+        {cell && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:6, background:cell.color+"2A", color:cell.color }}>{cell.label}</span>}
+        {esc && <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:6, background:`${C.orange}2A`, color:C.orange }}>Escalato</span>}
       </div>
 
       {(risk || esc) && (
@@ -1400,28 +1540,28 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
 
       {task.subtasks.length > 0 && (
         <div style={{ marginBottom:12 }}>
-          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8}}>
             <span style={{ fontSize:12, color:C.l2, fontWeight:500 }}>Avanzamento</span>
             <span style={{ fontSize:12, fontWeight:600, color:task.color }}>{task.progress}%</span>
           </div>
-          <div style={{ background:C.s3, borderRadius:5, height:6, overflow:"hidden" }}>
-            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
+          <div style={{ background:C.s3, borderRadius:6, height:6, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:6, transition:"width 0.3s" }} />
           </div>
           <div style={{ fontSize:11, color:C.l3, textAlign:"center", marginTop:4 }}>Calcolato dai sottotask</div>
         </div>
       )}
 
       <div style={{ marginBottom:12 }}>
-        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:7 }}>
+        <div style={{ display:"flex", justifyContent:"space-between", marginBottom:8}}>
           <span style={{ fontSize:12, fontWeight:500, color:C.l2 }}>Sotto-attività</span>
           <span style={{ fontSize:11, color:C.l3 }}>{doneSubs}/{task.subtasks.length}</span>
         </div>
         {task.subtasks.length > 0 && (
-          <div style={{ background:C.s2, borderRadius:10, overflow:"hidden", marginBottom:7 }}>
+          <div style={{ background:C.s2, borderRadius:10, overflow:"hidden", marginBottom:8}}>
             {task.subtasks.map((s, idx) => (
               <div key={s.id} style={{ display:"flex", alignItems:"center", padding:"8px 11px", borderBottom:idx < task.subtasks.length-1 ? `1px solid ${C.sep}` : "none", gap:8 }}>
                 <div onClick={() => onToggleSub(task.id, s.id)}
-                  style={{ width:15, height:15, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", transition:"all 0.2s" }}>
+                  style={{ width:15, height:15, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", cursor:"pointer", transition:"all 0.15s" }}>
                   {s.done && <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>}
                 </div>
                 {editingSub && editingSub.id === s.id ? (
@@ -1454,29 +1594,28 @@ function DetailPanel({ task, onClose, onEdit, onDelete, onComplete, onUncomplete
                 )}
                 {!s.done && (
                   <button onClick={() => onSetNext(task.id, s.id)}
-                    style={{ background:s.next ? task.color+"22" : "none", border:`1px solid ${s.next ? task.color : C.s3}`, color:s.next ? task.color : C.l3, borderRadius:5, padding:"1px 6px", cursor:"pointer", fontSize:9, fontWeight:700, flexShrink:0 }}>
+                    style={{ background:s.next ? task.color+"22" : "none", border:`1px solid ${s.next ? task.color : C.s3}`, color:s.next ? task.color : C.l3, borderRadius:6, padding:"1px 6px", cursor:"pointer", fontSize:11, fontWeight:700, flexShrink:0 }}>
                     {s.next ? "→ next" : "→"}
                   </button>
                 )}
-                <button onClick={() => onDelSub(task.id, s.id)}
+                <HoverBtn onClick={() => onDelSub(task.id, s.id)}
                   style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:15, padding:0, opacity:0, transition:"opacity 0.15s" }}
-                  onMouseEnter={e => e.currentTarget.style.opacity = "0.7"}
-                  onMouseLeave={e => e.currentTarget.style.opacity = "0"}>−</button>
+                  hoverStyle={{ opacity:0.7 }}>−</HoverBtn>
               </div>
             ))}
           </div>
         )}
         {task.type !== "inbox" && (
-          <div style={{ display:"flex", gap:6 }}>
+          <div style={{ display:"flex", gap:8}}>
             <input style={inp(C,{ flex:1, fontSize:13, padding:"8px 11px" })} value={subIn} placeholder="Aggiungi voce…" onChange={e => setSubIn(e.target.value)} onKeyDown={e => e.key === "Enter" && addSubPanel()} />
-            <button onClick={addSubPanel} style={{ background:C.s2, border:"none", color:C.blue, borderRadius:9, width:34, cursor:"pointer", fontSize:18, flexShrink:0 }}>+</button>
+            <button onClick={addSubPanel} style={{ background:C.s2, border:"none", color:C.blue, borderRadius:10, width:34, cursor:"pointer", fontSize:17, flexShrink:0 }}>+</button>
           </div>
         )}
       </div>
 
       <AttachmentSection task={task} onAdd={onAddAttachment} onRemove={onRemoveAttachment} />
 
-      <div style={{ marginTop:"auto", paddingTop:8, display:"flex", flexDirection:"column", gap:6 }}>
+      <div style={{ marginTop:"auto", paddingTop:8, display:"flex", flexDirection:"column", gap:8}}>
         {task.progress < 100 ? (
           <button onClick={() => onComplete(task.id)} style={{ width:"100%", padding:"10px", borderRadius:10, border:"none", background:`${C.green}18`, color:C.green, cursor:"pointer", fontSize:13, fontWeight:600 }}>✓ Segna come completato</button>
         ) : (
@@ -1552,11 +1691,11 @@ function EndOfDayReview({ tasks, onClose, onDecide, onClassifyInbox }) {
   // ── Empty state ──
   if (total === 0) return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"36px 40px", maxWidth:400, width:"90vw", textAlign:"center", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"36px 40px", maxWidth:400, width:"90vw", textAlign:"center", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ fontSize:40, marginBottom:16 }}>✦</div>
-        <div style={{ fontSize:20, fontWeight:700, color:C.l1 }}>Niente da chiudere.</div>
+        <div style={{ fontSize:17, fontWeight:700, color:C.l1 }}>Niente da chiudere.</div>
         <div style={{ fontSize:14, color:C.l3, marginTop:8, marginBottom:24 }}>Agenda vuota, inbox pulita. Ottimo lavoro.</div>
-        <button onClick={onClose} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:12, padding:"11px 28px", fontWeight:600, fontSize:15, cursor:"pointer" }}>Chiudi</button>
+        <button onClick={onClose} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:14, padding:"11px 28px", fontWeight:600, fontSize:15, cursor:"pointer" }}>Chiudi</button>
       </div>
     </div>
   );
@@ -1572,30 +1711,30 @@ function EndOfDayReview({ tasks, onClose, onDecide, onClassifyInbox }) {
 
   // ── Section label helper ──
   const SectionLabel = ({ color, label, count }) => (
-    <div style={{ display:"flex", alignItems:"center", gap:7, marginBottom:10 }}>
+    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8}}>
       <div style={{ width:5, height:5, borderRadius:"50%", background:color, flexShrink:0 }} />
-      <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:1.1 }}>{label.toUpperCase()}</span>
+      <span style={{ fontSize:11, fontWeight:700, color, letterSpacing:0.5 }}>{label.toUpperCase()}</span>
       <span style={{ fontSize:12, color:C.l3 }}>{count}</span>
     </div>
   );
 
   return (
     <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.75)", backdropFilter:"blur(24px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"28px 28px 24px", width:540, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"28px 28px 24px", width:540, maxWidth:"95vw", maxHeight:"88vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
 
         {/* Header */}
         <div style={{ marginBottom:20, flexShrink:0 }}>
           <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
             <div>
-              <div style={{ fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Chiusura giornata</div>
+              <div style={{ fontSize:17, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Chiusura giornata</div>
               <div style={{ fontSize:12, color:C.l3, marginTop:3 }}>{now} · {total} voci da sistemare</div>
             </div>
-            <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
+            <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
           </div>
-          <div style={{ marginTop:14, background:C.s3, borderRadius:4, height:3, overflow:"hidden" }}>
+          <div style={{ marginTop:16, background:C.s3, borderRadius:4, height:3, overflow:"hidden" }}>
             <div style={{ height:"100%", width:`${pct}%`, background:C.green, borderRadius:4, transition:"width 0.4s" }} />
           </div>
-          <div style={{ fontSize:11, color:C.l3, marginTop:5 }}>{decided} di {total} decisi</div>
+          <div style={{ fontSize:11, color:C.l3, marginTop:4}}>{decided} di {total} decisi</div>
         </div>
 
         {/* Scrollable body */}
@@ -1610,25 +1749,25 @@ function EndOfDayReview({ tasks, onClose, onDecide, onClassifyInbox }) {
                 const dL  = t.end ? workDiff(today, t.end) : null;
                 const isOverdue = dL !== null && dL < 0;
                 return (
-                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.2s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
-                    <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:dec ? 0 : 10 }}>
+                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.15s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:dec ? 0 : 10 }}>
                       <div style={{ width:7, height:7, borderRadius:"50%", background:t.color, flexShrink:0 }} />
                       <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
-                      {isOverdue && <span style={{ fontSize:10, color:C.red, fontWeight:600 }}>scaduto</span>}
+                      {isOverdue && <span style={{ fontSize:11, color:C.red, fontWeight:600 }}>scaduto</span>}
                     </div>
                     {!dec ? (
-                      <div style={{ display:"flex", gap:6, flexWrap:"wrap" }}>
-                        <button onClick={() => decide(t.id, "done")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:`${C.green}22`, color:C.green, cursor:"pointer", fontSize:12, fontWeight:600 }}>✓ Fatto</button>
-                        <button onClick={() => decide(t.id, "tomorrow")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>→ Domani</button>
+                      <div style={{ display:"flex", gap:8, flexWrap:"wrap" }}>
+                        <button onClick={() => decide(t.id, "done")} style={{ padding:"6px 13px", borderRadius:10, border:"none", background:`${C.green}22`, color:C.green, cursor:"pointer", fontSize:12, fontWeight:600 }}>✓ Fatto</button>
+                        <button onClick={() => decide(t.id, "tomorrow")} style={{ padding:"6px 13px", borderRadius:10, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>→ Domani</button>
                         <div style={{ display:"flex", alignItems:"center", gap:4 }}>
                           <input type="date" value={customDate[t.id] || ""} min={T(2)}
                             onChange={e => setCustomDate(d => ({ ...d, [t.id]: e.target.value }))}
-                            style={{ background:C.s3, border:"none", borderRadius:9, padding:"6px 10px", color:C.l2, fontSize:12, colorScheme: C === LIGHT ? "light" : "dark", fontFamily:"inherit", cursor:"pointer" }} />
+                            style={{ background:C.s3, border:"none", borderRadius:10, padding:"6px 10px", color:C.l2, fontSize:12, colorScheme: C === LIGHT ? "light" : "dark", fontFamily:"inherit", cursor:"pointer" }} />
                           {customDate[t.id] && (
-                            <button onClick={() => decide(t.id, `date:${customDate[t.id]}`)} style={{ padding:"6px 10px", borderRadius:9, border:"none", background:`${C.orange}22`, color:C.orange, cursor:"pointer", fontSize:12, fontWeight:600 }}>OK</button>
+                            <button onClick={() => decide(t.id, `date:${customDate[t.id]}`)} style={{ padding:"6px 10px", borderRadius:10, border:"none", background:`${C.orange}22`, color:C.orange, cursor:"pointer", fontSize:12, fontWeight:600 }}>OK</button>
                           )}
                         </div>
-                        <button onClick={() => decide(t.id, "drop")} style={{ padding:"6px 13px", borderRadius:9, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>Lascia stare</button>
+                        <button onClick={() => decide(t.id, "drop")} style={{ padding:"6px 13px", borderRadius:10, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>Lascia stare</button>
                       </div>
                     ) : (
                       <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
@@ -1659,20 +1798,20 @@ function EndOfDayReview({ tasks, onClose, onDecide, onClassifyInbox }) {
               {inboxItems.map(t => {
                 const dec = inboxDec[t.id];
                 return (
-                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.2s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
-                    <div style={{ display:"flex", alignItems:"center", gap:9, marginBottom:dec ? 0 : 10 }}>
+                  <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"13px 14px", border:`1.5px solid ${dec ? `${C.green}40` : "transparent"}`, transition:"all 0.15s", opacity:dec ? 0.7 : 1, marginBottom:2 }}>
+                    <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:dec ? 0 : 10 }}>
                       <div style={{ width:7, height:7, borderRadius:"50%", background:C.yellow, flexShrink:0 }} />
                       <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
-                      <span style={{ fontSize:10, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>
+                      <span style={{ fontSize:11, fontWeight:600, padding:"2px 6px", borderRadius:6, background:`${C.yellow}2A`, color:C.yellow }}>inbox</span>
                     </div>
                     {!dec ? (
-                      <div style={{ display:"flex", gap:6 }}>
+                      <div style={{ display:"flex", gap:8}}>
                         <button onClick={() => setClassifying(t)}
-                          style={{ padding:"6px 14px", borderRadius:9, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>
+                          style={{ padding:"6px 14px", borderRadius:10, border:"none", background:`${C.blue}22`, color:C.blue, cursor:"pointer", fontSize:12, fontWeight:600 }}>
                           Classifica →
                         </button>
                         <button onClick={() => decideInbox(t.id, "tomorrow")}
-                          style={{ padding:"6px 13px", borderRadius:9, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>
+                          style={{ padding:"6px 13px", borderRadius:10, border:"none", background:"transparent", color:C.l3, cursor:"pointer", fontSize:12, marginLeft:"auto" }}>
                           Lascia in inbox
                         </button>
                       </div>
@@ -1706,12 +1845,12 @@ function ConfirmDialog({ message, onConfirm, onCancel }) {
   const C = useContext(ThemeCtx);
   return (
     <div onClick={onCancel} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", backdropFilter:"blur(16px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:400 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:18, padding:"28px 28px 22px", width:340, maxWidth:"90vw", boxShadow:"0 24px 60px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"28px 28px 22px", width:340, maxWidth:"90vw", boxShadow:"0 24px 60px rgba(0,0,0,0.5)" }}>
         <div style={{ fontSize:15, fontWeight:600, color:C.l1, marginBottom:8, lineHeight:1.4 }}>{message}</div>
-        <div style={{ fontSize:13, color:C.l3, marginBottom:22 }}>Questa azione è irreversibile.</div>
+        <div style={{ fontSize:13, color:C.l3, marginBottom:24}}>Questa azione è irreversibile.</div>
         <div style={{ display:"flex", gap:8 }}>
-          <button onClick={onCancel} style={{ flex:1, padding:"11px", borderRadius:11, border:"none", background:C.s2, color:C.l2, cursor:"pointer", fontSize:14, fontWeight:500 }}>Annulla</button>
-          <button onClick={onConfirm} style={{ flex:1, padding:"11px", borderRadius:11, border:"none", background:C.red, color:"#fff", cursor:"pointer", fontSize:14, fontWeight:600 }}>Elimina</button>
+          <button onClick={onCancel} style={{ flex:1, padding:"11px", borderRadius:10, border:"none", background:C.s2, color:C.l2, cursor:"pointer", fontSize:14, fontWeight:500 }}>Annulla</button>
+          <button onClick={onConfirm} style={{ flex:1, padding:"11px", borderRadius:10, border:"none", background:C.red, color:"#fff", cursor:"pointer", fontSize:14, fontWeight:600 }}>Elimina</button>
         </div>
       </div>
     </div>
@@ -1746,25 +1885,25 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
   return (
     <>
       <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.6)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300 }}>
-        <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px 24px 20px", width:500, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+        <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"24px 24px 20px", width:500, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
 
           {/* Header */}
-          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:18, flexShrink:0 }}>
+          <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:16, flexShrink:0 }}>
             <div style={{ display:"flex", alignItems:"center", gap:8 }}>
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke={C.l2} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                 <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
               </svg>
-              <span style={{ fontSize:16, fontWeight:700, color:C.l1 }}>Cestino</span>
+              <span style={{ fontSize:17, fontWeight:700, color:C.l1 }}>Cestino</span>
               <span style={{ fontSize:12, color:C.l3 }}>{total} {total === 1 ? "elemento" : "elementi"}</span>
             </div>
-            <div style={{ display:"flex", gap:6, alignItems:"center" }}>
+            <div style={{ display:"flex", gap:8, alignItems:"center" }}>
               {total > 0 && (
                 <button onClick={() => setConfirm("all")}
-                  style={{ fontSize:12, color:C.red, background:`${C.red}15`, border:"none", borderRadius:8, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
+                  style={{ fontSize:12, color:C.red, background:`${C.red}15`, border:"none", borderRadius:10, padding:"5px 12px", cursor:"pointer", fontWeight:600, fontFamily:"inherit" }}>
                   Svuota cestino
                 </button>
               )}
-              <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+              <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
             </div>
           </div>
 
@@ -1777,15 +1916,15 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
               <div style={{ fontSize:14 }}>Il cestino è vuoto</div>
             </div>
           ) : (
-            <div style={{ overflowY:"auto", flex:1, display:"flex", flexDirection:"column", gap:14 }}>
+            <div style={{ overflowY:"auto", flex:1, display:"flex", flexDirection:"column", gap:12}}>
 
               {/* Tasks section */}
               {trash.length > 0 && (
                 <div>
-                  <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:6 }}>TASK</div>
-                  <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5, marginBottom:8}}>TASK</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:4}}>
                     {trash.map(t => (
-                      <div key={t.id} style={{ background:C.s2, borderRadius:12, padding:"11px 13px", display:"flex", alignItems:"center", gap:10 }}>
+                      <div key={t.id} style={{ background:C.s2, borderRadius:14, padding:"11px 13px", display:"flex", alignItems:"center", gap:12}}>
                         <div style={{ width:7, height:7, borderRadius:"50%", background:t.color, flexShrink:0 }} />
                         <div style={{ flex:1, minWidth:0 }}>
                           <div style={{ fontSize:13, fontWeight:600, color:C.l2, marginBottom:1 }}>{t.title}</div>
@@ -1795,11 +1934,11 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
                           </div>
                         </div>
                         <button onClick={() => onRestore(t.id)}
-                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
+                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:6, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
                           Ripristina
                         </button>
                         <button onClick={() => setConfirm(`task:${t.id}`)}
-                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
+                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:6, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
                           Elimina
                         </button>
                       </div>
@@ -1811,10 +1950,10 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
               {/* Attachments section */}
               {attTrash.length > 0 && (
                 <div>
-                  <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:6 }}>ALLEGATI</div>
-                  <div style={{ display:"flex", flexDirection:"column", gap:5 }}>
+                  <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5, marginBottom:8}}>ALLEGATI</div>
+                  <div style={{ display:"flex", flexDirection:"column", gap:4}}>
                     {attTrash.map(a => (
-                      <div key={a.id} style={{ background:C.s2, borderRadius:12, padding:"11px 13px", display:"flex", alignItems:"center", gap:10 }}>
+                      <div key={a.id} style={{ background:C.s2, borderRadius:14, padding:"11px 13px", display:"flex", alignItems:"center", gap:12}}>
                         <span style={{ color:C.l3, flexShrink:0 }}><Icon name={iconFor(a.type)} size={13} color="currentColor"/></span>
                         <div style={{ flex:1, minWidth:0 }}>
                           <div style={{ fontSize:13, fontWeight:600, color:C.l2, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", marginBottom:1 }}>{a.name}</div>
@@ -1825,11 +1964,11 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
                           </div>
                         </div>
                         <button onClick={() => onRestoreAtt(a.id)}
-                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
+                          style={{ fontSize:12, fontWeight:600, color:C.blue, background:`${C.blue}18`, border:"none", borderRadius:6, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit", lineHeight:1 }}>
                           Ripristina
                         </button>
                         <button onClick={() => setConfirm(`att:${a.id}`)}
-                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:7, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
+                          style={{ fontSize:12, fontWeight:500, color:C.red, background:`${C.red}15`, border:"none", borderRadius:6, padding:"5px 10px", cursor:"pointer", flexShrink:0, fontFamily:"inherit" }}>
                           Elimina
                         </button>
                       </div>
@@ -1856,42 +1995,39 @@ function TrashModal({ trash, attTrash, onClose, onRestore, onDeleteOne, onRestor
 
 function DoneSection({ done, sel, setSel, setTasks, trashAll, sep }) {
   const C = useContext(ThemeCtx);
-  const [collapsed, setCollapsed] = useState(function() {
-    try { return localStorage.getItem(LS_DONE_HIDE) === "1"; } catch(e) { return false; }
-  });
+  const [collapsed, setCollapsed] = useState(() => lsRead(LS_DONE_HIDE, null) === "1");
   function toggleCollapsed() {
-    setCollapsed(function(c) {
-      var next = !c;
-      try { localStorage.setItem(LS_DONE_HIDE, next ? "1" : "0"); } catch(e) {}
+    setCollapsed(c => {
+      const next = !c;
+      lsWrite(LS_DONE_HIDE, next ? "1" : "0");
       return next;
     });
   }
   return (
     <div style={{ marginBottom:24 }} onClick={e => e.stopPropagation()}>
-      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:9, cursor:"pointer", userSelect:"none" }} onClick={toggleCollapsed}>
+      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:8, cursor:"pointer", userSelect:"none" }} onClick={toggleCollapsed}>
         <div style={{ width:5, height:5, borderRadius:"50%", background:C.l3 }} />
-        <span style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:1.1 }}>COMPLETATI</span>
+        <span style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5 }}>COMPLETATI</span>
         <span style={{ fontSize:12, color:C.l3 }}>{done.length}</span>
         <button onClick={e => { e.stopPropagation(); trashAll(done.map(t => t.id)); }}
-          style={{ marginLeft:"auto", fontSize:11, color:C.l3, background:"none", border:`1px solid ${sep}`, borderRadius:7, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit" }}>
+          style={{ marginLeft:"auto", fontSize:11, color:C.l3, background:"none", border:`1px solid ${sep}`, borderRadius:6, padding:"3px 10px", cursor:"pointer", fontFamily:"inherit" }}>
           Sposta nel cestino
         </button>
-        <span style={{ color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.2s", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
+        <span style={{ color:C.l3, display:"flex", alignItems:"center", transition:"transform 0.15s ease-out", transform:collapsed ? "rotate(-90deg)" : "rotate(0deg)" }}>
           <svg width="12" height="7" viewBox="0 0 12 7" fill="none"><path d="M1 1L6 6L11 1" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round"/></svg>
         </span>
       </div>
       {!collapsed && (
-        <div style={{ background:C.s1, borderRadius:16, overflow:"hidden", opacity:0.5, boxShadow:C.shadow }}>
+        <div style={{ background:C.s1, borderRadius:14, overflow:"hidden", opacity:0.5, boxShadow:C.shadow }}>
           {done.map((t, idx) => (
             <div key={t.id} onClick={() => setSel(sel===t.id?null:t.id)}
               style={{ display:"flex", alignItems:"center", gap:12, padding:"10px 16px", borderBottom:idx < done.length-1 ? `1px solid ${C.sep}` : "none", cursor:"pointer" }}>
-              <div onClick={e => { e.stopPropagation(); setTasks(ts => ts.map(u => u.id === t.id ? { ...u, progress:0 } : u)); setSel(null); }}
+              <HoverDiv onClick={e => { e.stopPropagation(); setTasks(ts => ts.map(u => u.id === t.id ? { ...u, progress:0 } : u)); setSel(null); }}
                 title="Segna come non completato"
                 style={{ width:13, height:13, borderRadius:"50%", background:C.green, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0, cursor:"pointer", transition:"opacity 0.15s" }}
-                onMouseEnter={e => e.currentTarget.style.opacity="0.4"}
-                onMouseLeave={e => e.currentTarget.style.opacity="1"}>
+                hoverStyle={{ opacity:0.4 }}>
                 <svg width="8" height="7" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>
-              </div>
+              </HoverDiv>
               <span style={{ fontSize:13, color:C.l3, textDecoration:"line-through", flex:1 }}>{t.title}</span>
             </div>
           ))}
@@ -1903,10 +2039,10 @@ function DoneSection({ done, sel, setSel, setTasks, trashAll, sep }) {
 
 function parseDate(str) {
   if (!str) return null;
-  var p = str.split("-");
+  const p = str.split("-");
   return p.length === 3 ? new Date(+p[0], +p[1]-1, +p[2]) : null;
 }
-function addDays(d, n) { var r = new Date(d); r.setDate(r.getDate()+n); return r; }
+function addDays(d, n) { let r = new Date(d); r.setDate(r.getDate()+n); return r; }
 function diffDays(a, b) { return Math.round((b - a) / 86400000); }
 
 function GanttView({ tasks, onSelect }) {
@@ -1979,11 +2115,11 @@ function GanttView({ tasks, onSelect }) {
       {/* Controls */}
       <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:20, flexWrap:"wrap" }}>
         <button onClick={() => setOffset(o => o-2)}
-          style={{ background:C.s2, border:"none", borderRadius:8, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>‹</button>
+          style={{ background:C.s2, border:"none", borderRadius:10, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>‹</button>
         <button onClick={() => setOffset(0)}
-          style={{ background: offset===0 ? `${C.blue}22` : C.s2, border:"none", borderRadius:8, padding:"5px 14px", cursor:"pointer", color: offset===0 ? C.blue : C.l2, fontSize:12, fontWeight:600, fontFamily:"inherit" }}>Oggi</button>
+          style={{ background: offset===0 ? `${C.blue}22` : C.s2, border:"none", borderRadius:10, padding:"5px 14px", cursor:"pointer", color: offset===0 ? C.blue : C.l2, fontSize:12, fontWeight:600, fontFamily:"inherit" }}>Oggi</button>
         <button onClick={() => setOffset(o => o+2)}
-          style={{ background:C.s2, border:"none", borderRadius:8, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>›</button>
+          style={{ background:C.s2, border:"none", borderRadius:10, width:30, height:30, cursor:"pointer", color:C.l2, fontSize:17, lineHeight:1, fontFamily:"inherit", display:"flex", alignItems:"center", justifyContent:"center" }}>›</button>
         <span style={{ fontSize:12, color:C.l3 }}>{fmtShort(winStart)} → {fmtShort(winEnd)}</span>
       </div>
 
@@ -1994,13 +2130,13 @@ function GanttView({ tasks, onSelect }) {
           {/* Month row */}
           <div style={{ display:"flex", borderBottom:sep, height:HEAD_H }}>
             <div style={{ width:LABEL_W, flexShrink:0, display:"flex", alignItems:"center", paddingLeft:14 }}>
-              <span style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:0.8 }}>PROGETTO</span>
+              <span style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.8 }}>PROGETTO</span>
             </div>
             <div style={{ flex:1, position:"relative", overflow:"hidden" }}>
               {months.map(function(m,i){
                 return (
                   <div key={i} style={{ position:"absolute", left:m.pct+"%", top:0, bottom:0, borderLeft:`1px solid ${C.sep}` }}>
-                    <span style={{ position:"absolute", top:7, left:6, fontSize:10, fontWeight:700, color:C.l2, whiteSpace:"nowrap" }}>{m.label}</span>
+                    <span style={{ position:"absolute", top:7, left:6, fontSize:11, fontWeight:700, color:C.l2, whiteSpace:"nowrap" }}>{m.label}</span>
                   </div>
                 );
               })}
@@ -2016,7 +2152,7 @@ function GanttView({ tasks, onSelect }) {
                 return (
                   <div key={i} style={{ position:"absolute", left:wk.pct+"%", top:0, bottom:0 }}>
                     <div style={{ position:"absolute", top:0, left:0, width:1, bottom:0, background:C.sep, opacity:0.6 }} />
-                    <span style={{ position:"absolute", top:4, left:4, fontSize:9, color:C.l3, whiteSpace:"nowrap" }}>{wk.label}</span>
+                    <span style={{ position:"absolute", top:4, left:4, fontSize:11, color:C.l3, whiteSpace:"nowrap" }}>{wk.label}</span>
                   </div>
                 );
               })}
@@ -2032,19 +2168,18 @@ function GanttView({ tasks, onSelect }) {
             const isLate = daysLeft < 0 && prog < 100;
 
             return (
-              <div key={task.id}
-                style={{ display:"flex", alignItems:"stretch", borderBottom: idx < planned.length-1 ? sep : "none", cursor:"pointer", transition:"background 0.12s" }}
-                onMouseEnter={function(ev){ ev.currentTarget.style.background = C.s2; }}
-                onMouseLeave={function(ev){ ev.currentTarget.style.background = ""; }}
+              <HoverDiv key={task.id}
+                style={{ display:"flex", alignItems:"stretch", borderBottom: idx < planned.length-1 ? sep : "none", cursor:"pointer", transition:"background 0.15s" }}
+                hoverStyle={{ background:C.s2 }}
                 onClick={() => onSelect(task.id)}>
 
                 {/* Label */}
                 <div style={{ width:LABEL_W, flexShrink:0, padding:"0 14px", display:"flex", flexDirection:"column", justifyContent:"center", minHeight:ROW_H }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:6, marginBottom:2 }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:2 }}>
                     <div style={{ width:7, height:7, borderRadius:"50%", background:task.color, flexShrink:0 }} />
                     <span style={{ fontSize:12, fontWeight:600, color: isLate ? C.red : C.l1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{task.title}</span>
                   </div>
-                  <div style={{ fontSize:10, color: isLate ? C.red : C.l3, paddingLeft:13 }}>
+                  <div style={{ fontSize:11, color: isLate ? C.red : C.l3, paddingLeft:13 }}>
                     {isLate
                       ? "ritardo "+Math.abs(daysLeft)+"g"
                       : prog > 0
@@ -2087,11 +2222,11 @@ function GanttView({ tasks, onSelect }) {
                   {/* % label */}
                   {prog > 0 && g.width > 8 && (
                     <div style={{ position:"absolute", left:g.left+"%", width:g.width+"%", top:"50%", height:BAR_H, marginTop:-(BAR_H/2), display:"flex", alignItems:"center", justifyContent:"center", pointerEvents:"none", zIndex:4 }}>
-                      <span style={{ fontSize:9, fontWeight:800, color:"#fff", textShadow:"0 1px 3px rgba(0,0,0,0.6)" }}>{prog}%</span>
+                      <span style={{ fontSize:11, fontWeight:800, color:"#fff", textShadow:"0 1px 3px rgba(0,0,0,0.6)" }}>{prog}%</span>
                     </div>
                   )}
                 </div>
-              </div>
+              </HoverDiv>
             );
           })}
 
@@ -2101,19 +2236,18 @@ function GanttView({ tasks, onSelect }) {
       {/* Unplanned projects */}
       {unplanned.length > 0 && (
         <div style={{ marginTop:24 }}>
-          <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1, marginBottom:8 }}>SENZA DATE</div>
+          <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5, marginBottom:8 }}>SENZA DATE</div>
           <div style={card(C)}>
             {unplanned.map(function(task,idx){
               return (
-                <div key={task.id}
-                  style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 16px", borderBottom: idx < unplanned.length-1 ? sep : "none", cursor:"pointer" }}
-                  onClick={() => onSelect(task.id)}
-                  onMouseEnter={function(ev){ ev.currentTarget.style.background = C.s2; }}
-                  onMouseLeave={function(ev){ ev.currentTarget.style.background = ""; }}>
+                <HoverDiv key={task.id}
+                  style={{ display:"flex", alignItems:"center", gap:12, padding:"11px 16px", borderBottom: idx < unplanned.length-1 ? sep : "none", cursor:"pointer" }}
+                  hoverStyle={{ background:C.s2 }}
+                  onClick={() => onSelect(task.id)}>
                   <div style={{ width:6, height:6, borderRadius:"50%", background:task.color, flexShrink:0 }} />
                   <span style={{ fontSize:13, color:C.l2 }}>{task.title}</span>
                   <span style={{ fontSize:11, color:C.l3, marginLeft:"auto" }}>Aggiungi date di inizio e fine per visualizzare</span>
-                </div>
+                </HoverDiv>
               );
             })}
           </div>
@@ -2179,7 +2313,7 @@ function StorageWarning({ onExport, onPurgeDone }) {
 
   return (
     <div style={{ margin:"0 0 16px 0", background:bg, border:"1px solid " + border, borderRadius:14, padding:"12px 14px" }}>
-      <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom: isCritical ? 10 : 8 }}>
+      <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom: isCritical ? 10 : 8 }}>
         <span style={{ flexShrink:0, display:"flex", alignItems:"center", color }}>
           <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
             <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
@@ -2195,19 +2329,19 @@ function StorageWarning({ onExport, onPurgeDone }) {
           </div>
         </div>
         <button onClick={() => setDismissed(true)}
-          style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:18, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
+          style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:17, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
       </div>
       {/* Progress bar */}
-      <div style={{ height:4, borderRadius:2, background:C.s3, overflow:"hidden", marginBottom:10 }}>
+      <div style={{ height:4, borderRadius:2, background:C.s3, overflow:"hidden", marginBottom:8}}>
         <div style={{ height:"100%", width: usage.pct + "%", background:color, borderRadius:2, transition:"width 0.3s" }} />
       </div>
       <div style={{ display:"flex", gap:8 }}>
         <button onClick={() => { onExport(); setDismissed(true); }}
-          style={{ fontSize:12, fontWeight:700, color:"#fff", background:color, border:"none", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
+          style={{ fontSize:12, fontWeight:700, color:"#fff", background:color, border:"none", borderRadius:10, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
           Esporta backup
         </button>
         <button onClick={() => { onPurgeDone(); const u = getStorageUsage(); setUsage(u); }}
-          style={{ fontSize:12, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
+          style={{ fontSize:12, fontWeight:600, color:C.l2, background:C.s3, border:"none", borderRadius:10, padding:"6px 13px", cursor:"pointer", fontFamily:"inherit" }}>
           Svuota completati
         </button>
       </div>
@@ -2278,21 +2412,10 @@ function BackupReminder({ onExport }) {
   const SNOOZE_KEY = "tm_v1_backup_snoozed";
   const [visible, setVisible] = useState(() => {
     try {
-      // Snoozed oggi?
-      const snoozed = localStorage.getItem(SNOOZE_KEY);
-      if (snoozed === today) return false;
-      // Mai esportato?
-      const last = localStorage.getItem(LS_LAST_EXPORT);
-      if (!last) {
-        // Mostra solo se ci sono dati (almeno 3 task)
-        try {
-          const tasks = JSON.parse(localStorage.getItem(LS_KEY) || "[]");
-          return tasks.length >= 3;
-        } catch { return false; }
-      }
-      // Esportato più di 7 giorni fa?
-      const daysSince = Math.floor((Date.now() - parseInt(last)) / 86400000);
-      return daysSince >= 7;
+      if (lsRead(SNOOZE_KEY, null) === today) return false;
+      const last = lsRead(LS_LAST_EXPORT, null);
+      if (!last) return lsRead(LS_KEY, [], true).length >= 3;
+      return Math.floor((Date.now() - parseInt(last)) / 86400000) >= 7;
     } catch { return false; }
   });
 
@@ -2303,12 +2426,12 @@ function BackupReminder({ onExport }) {
     setVisible(false);
   }
   function handleSnooze() {
-    try { localStorage.setItem(SNOOZE_KEY, today); } catch {}
+    lsWrite(SNOOZE_KEY, today);
     setVisible(false);
   }
 
   return (
-    <div style={{ margin:"0 0 16px 0", background:`${C.yellow}14`, border:`1px solid ${C.yellow}40`, borderRadius:14, padding:"11px 14px", display:"flex", alignItems:"center", gap:10 }}>
+    <div style={{ margin:"0 0 16px 0", background:`${C.yellow}14`, border:`1px solid ${C.yellow}40`, borderRadius:14, padding:"11px 14px", display:"flex", alignItems:"center", gap:12}}>
       <span style={{ flexShrink:0, display:"flex", alignItems:"center", color:C.yellow }}>
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
           <path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/>
@@ -2319,22 +2442,20 @@ function BackupReminder({ onExport }) {
       <div style={{ flex:1, minWidth:0 }}>
         <span style={{ fontSize:13, color:C.l1, fontWeight:500 }}>
           {(() => {
-            try {
-              const last = localStorage.getItem(LS_LAST_EXPORT);
-              if (!last) return "Non hai mai esportato un backup.";
-              const days = Math.floor((Date.now() - parseInt(last)) / 86400000);
-              const when = days === 1 ? "ieri" : days + " giorni fa";
-              return "Ultimo backup " + when + ". I dati sono solo nel browser.";
-            } catch { return "Non hai mai esportato un backup."; }
+            const last = lsRead(LS_LAST_EXPORT, null);
+            if (!last) return "Non hai mai esportato un backup.";
+            const days = Math.floor((Date.now() - parseInt(last)) / 86400000);
+            const when = days === 1 ? "ieri" : days + " giorni fa";
+            return "Ultimo backup " + when + ". I dati sono solo nel browser.";
           })()}
         </span>
       </div>
       <button onClick={handleExport}
-        style={{ background:C.yellow, border:"none", color:"#000", borderRadius:9, padding:"6px 13px", cursor:"pointer", fontSize:12, fontWeight:700, fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
+        style={{ background:C.yellow, border:"none", color:"#000", borderRadius:10, padding:"6px 13px", cursor:"pointer", fontSize:12, fontWeight:700, fontFamily:"inherit", flexShrink:0, whiteSpace:"nowrap" }}>
         Esporta ora
       </button>
       <button onClick={handleSnooze} title="Ricordamelo domani"
-        style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:18, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
+        style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", fontSize:17, padding:"0 2px", lineHeight:1, flexShrink:0 }}>×</button>
     </div>
   );
 }
@@ -2361,7 +2482,7 @@ function CompletionToast({ toast }) {
     <div style={{
       position:"fixed", bottom:24, right:24, zIndex:400,
       background:C.s1, border:"1px solid " + C.sep,
-      borderRadius:12, padding:"10px 14px",
+      borderRadius:14, padding:"10px 14px",
       boxShadow:"0 4px 24px rgba(0,0,0,0.18)",
       display:"flex", alignItems:"center", gap:8,
       maxWidth:220, pointerEvents:"none",
@@ -2436,30 +2557,30 @@ function HelpModal({ onClose }) {
   ];
 
   const Key = ({ k }) => (
-    <span style={{ display:"inline-flex", alignItems:"center", justifyContent:"center", minWidth:26, height:22, padding:"0 7px", borderRadius:6, background:C.s3, border:`1px solid ${C.sep}`, fontSize:11, fontWeight:600, color:C.l2, fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text',sans-serif", letterSpacing:0 }}>
+    <span style={{ display:"inline-flex", alignItems:"center", justifyContent:"center", minWidth:26, height:22, padding:"0 7px", borderRadius:6, background:C.s3, border:`1px solid ${C.sep}`, fontSize:11, fontWeight:600, color:C.l2, fontFamily:"inherit", letterSpacing:0 }}>
       {k}
     </span>
   );
 
   return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.5)", backdropFilter:"blur(20px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:300 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:22, padding:"24px 24px 20px", width:420, maxWidth:"95vw", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"24px 24px 20px", width:420, maxWidth:"95vw", boxShadow:"0 28px 70px rgba(0,0,0,0.5)" }}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:20 }}>
           <span style={{ fontSize:17, fontWeight:700, color:C.l1 }}>Scorciatoie da tastiera</span>
-          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
+          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13 }}>✕</button>
         </div>
         <div style={{ display:"flex", flexDirection:"column", gap:20 }}>
           {groups.map(g => (
             <div key={g.label}>
-              <div style={{ fontSize:10, fontWeight:700, color:C.l3, letterSpacing:1.1, marginBottom:10 }}>{g.label.toUpperCase()}</div>
-              <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+              <div style={{ fontSize:11, fontWeight:700, color:C.l3, letterSpacing:0.5, marginBottom:8}}>{g.label.toUpperCase()}</div>
+              <div style={{ display:"flex", flexDirection:"column", gap:8}}>
                 {g.shortcuts.map((s, i) => (
                   <div key={i} style={{ display:"flex", alignItems:"center", justifyContent:"space-between", gap:12 }}>
                     <span style={{ fontSize:13, color:C.l2 }}>{s.desc}</span>
                     <div style={{ display:"flex", gap:4, alignItems:"center", flexShrink:0 }}>
                       {s.keys.map((k, ki) => (
                         <React.Fragment key={ki}>
-                          {ki > 0 && <span style={{ fontSize:10, color:C.l3 }}>+</span>}
+                          {ki > 0 && <span style={{ fontSize:11, color:C.l3 }}>+</span>}
                           <Key k={k} />
                         </React.Fragment>
                       ))}
@@ -2486,13 +2607,13 @@ function FocusPicker({ tasks, onPick, onClose }) {
 
   return (
     <div onClick={onClose} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.7)", backdropFilter:"blur(24px)", display:"flex", alignItems:"center", justifyContent:"center", zIndex:200 }}>
-      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:24, padding:"28px 24px 24px", width:460, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
+      <div onClick={e => e.stopPropagation()} style={{ background:C.s1, borderRadius:20, padding:"28px 24px 24px", width:460, maxWidth:"95vw", maxHeight:"85vh", display:"flex", flexDirection:"column", boxShadow:"0 32px 80px rgba(0,0,0,0.5)" }}>
         <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start", marginBottom:20, flexShrink:0 }}>
           <div>
-            <div style={{ fontSize:18, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Su cosa lavori adesso?</div>
+            <div style={{ fontSize:17, fontWeight:700, color:C.l1, letterSpacing:-0.3 }}>Su cosa lavori adesso?</div>
             <div style={{ fontSize:13, color:C.l3, marginTop:4 }}>{todayTasks.length > 0 ? "Task di oggi" : "Nessun task oggi — task della settimana"}</div>
           </div>
-          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:8, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
+          <button onClick={onClose} style={{ background:C.s3, border:"none", color:C.l2, borderRadius:10, width:28, height:28, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:13, flexShrink:0 }}>✕</button>
         </div>
         {candidates.length === 0 ? (
           <div style={{ textAlign:"center", padding:"32px 0", color:C.l3, fontSize:14 }}>Nessun task attivo da focalizzare.</div>
@@ -2502,19 +2623,18 @@ function FocusPicker({ tasks, onPick, onClose }) {
               const dL = t.end ? workDiff(today, t.end) : null;
               const doneSubs = t.subtasks.filter(s => s.done).length;
               return (
-                <div key={t.id} onClick={() => onPick(t.id)}
+                <HoverDiv key={t.id} onClick={() => onPick(t.id)}
                   style={{ background:C.s2, borderRadius:14, padding:"14px 16px", cursor:"pointer", border:`1.5px solid transparent`, transition:"all 0.15s" }}
-                  onMouseEnter={e => { e.currentTarget.style.background = C.s3; e.currentTarget.style.borderColor = t.color + "60"; }}
-                  onMouseLeave={e => { e.currentTarget.style.background = C.s2; e.currentTarget.style.borderColor = "transparent"; }}>
-                  <div style={{ display:"flex", alignItems:"center", gap:9 }}>
+                  hoverStyle={{ background:C.s3, borderColor:t.color+"60" }}>
+                  <div style={{ display:"flex", alignItems:"center", gap:8}}>
                     <div style={{ width:8, height:8, borderRadius:"50%", background:t.color, flexShrink:0 }} />
                     <span style={{ fontSize:14, fontWeight:600, color:C.l1, flex:1, lineHeight:1.3 }}>{t.title}</span>
                     {dL !== null && <span style={{ fontSize:11, color: dL <= 0 ? C.red : C.l3, flexShrink:0 }}>{dL < 0 ? `${Math.abs(dL)}gg fa` : dL === 0 ? "Oggi" : `${dL}gg lav.`}</span>}
                   </div>
                   {t.subtasks.length > 0 && (
-                    <div style={{ fontSize:12, color:C.l3, marginTop:5, paddingLeft:17 }}>{doneSubs}/{t.subtasks.length} sottotask</div>
+                    <div style={{ fontSize:12, color:C.l3, marginTop:4, paddingLeft:17 }}>{doneSubs}/{t.subtasks.length} sottotask</div>
                   )}
-                </div>
+                </HoverDiv>
               );
             })}
           </div>
@@ -2624,12 +2744,12 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
 
       {/* Top bar */}
       <div style={{ position:"absolute", top:20, left:24, right:24, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-        <div style={{ display:"flex", alignItems:"center", gap:7 }}>
+        <div style={{ display:"flex", alignItems:"center", gap:8}}>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke={C.blue} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
-          <span style={{ fontSize:11, fontWeight:700, color:C.blue, letterSpacing:1 }}>FOCUS</span>
+          <span style={{ fontSize:11, fontWeight:700, color:C.blue, letterSpacing:0.5 }}>FOCUS</span>
         </div>
         <button onClick={onExit}
-          style={{ background:"none", border:`1px solid ${C.sep}`, color:C.l3, borderRadius:10, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:500, fontFamily:"inherit", display:"flex", alignItems:"center", gap:6 }}>
+          style={{ background:"none", border:`1px solid ${C.sep}`, color:C.l3, borderRadius:10, padding:"7px 14px", cursor:"pointer", fontSize:12, fontWeight:500, fontFamily:"inherit", display:"flex", alignItems:"center", gap:8}}>
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
           Esci dal focus
         </button>
@@ -2644,14 +2764,13 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
             <div style={{ fontSize:12, color:C.l3, marginBottom:12, fontWeight:500, letterSpacing:0.5 }}>IMPOSTA UN TIMER <span style={{ opacity:0.5 }}>· opzionale</span></div>
             <div style={{ display:"flex", gap:8, justifyContent:"center", flexWrap:"wrap" }}>
               {[15, 25, 50].map(m => (
-                <button key={m} onClick={() => startTimer(m)}
-                  style={{ padding:"9px 20px", borderRadius:12, border:`1px solid ${C.sep}`, background:C.s2, color:C.l1, cursor:"pointer", fontSize:14, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}
-                  onMouseEnter={e => { e.currentTarget.style.background = C.s3; e.currentTarget.style.borderColor = C.blue+"80"; }}
-                  onMouseLeave={e => { e.currentTarget.style.background = C.s2; e.currentTarget.style.borderColor = C.sep; }}>
+                <HoverBtn key={m} onClick={() => startTimer(m)}
+                  style={{ padding:"9px 20px", borderRadius:14, border:`1px solid ${C.sep}`, background:C.s2, color:C.l1, cursor:"pointer", fontSize:14, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}
+                  hoverStyle={{ background:C.s3, borderColor:C.blue+"80" }}>
                   {m} min
-                </button>
+                </HoverBtn>
               ))}
-              <div style={{ display:"flex", alignItems:"center", gap:6, background:C.s2, borderRadius:12, border:`1px solid ${C.sep}`, padding:"4px 4px 4px 14px" }}>
+              <div style={{ display:"flex", alignItems:"center", gap:8, background:C.s2, borderRadius:14, border:`1px solid ${C.sep}`, padding:"4px 4px 4px 14px" }}>
                 <input
                   type="number" min="1" max="180" value={customMin}
                   onChange={e => setCustomMin(e.target.value)}
@@ -2660,7 +2779,7 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
                   style={{ width:38, background:"none", border:"none", outline:"none", fontSize:14, color:C.l1, fontFamily:"inherit", textAlign:"center" }}
                 />
                 <button onClick={() => +customMin > 0 && startTimer(+customMin)}
-                  style={{ background: +customMin > 0 ? C.blue : C.s3, border:"none", color: +customMin > 0 ? "#fff" : C.l3, borderRadius:9, padding:"6px 12px", cursor: +customMin > 0 ? "pointer" : "default", fontSize:12, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}>
+                  style={{ background: +customMin > 0 ? C.blue : C.s3, border:"none", color: +customMin > 0 ? "#fff" : C.l3, borderRadius:10, padding:"6px 12px", cursor: +customMin > 0 ? "pointer" : "default", fontSize:12, fontWeight:600, fontFamily:"inherit", transition:"all 0.15s" }}>
                   via
                 </button>
               </div>
@@ -2668,7 +2787,7 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
           </div>
         ) : (
           /* Running / expired */
-          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:14 }}>
+          <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:12}}>
             {/* SVG ring */}
             <div style={{ position:"relative", width:200, height:200 }}>
               <svg width="200" height="200" style={{ transform:"rotate(-90deg)" }}>
@@ -2714,7 +2833,7 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
           <div style={{ width:10, height:10, borderRadius:"50%", background:task.color, margin:"0 auto 12px" }} />
           <h2 style={{ margin:0, fontSize:24, fontWeight:700, color:C.l1, letterSpacing:-0.5, lineHeight:1.3 }}>{task.title}</h2>
           {dL !== null && (
-            <div style={{ marginTop:6, fontSize:13, color: dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
+            <div style={{ marginTop:8, fontSize:13, color: dL < 0 ? C.red : dL === 0 ? C.yellow : C.l3 }}>
               {dL < 0 ? `Scaduto ${Math.abs(dL)} giorni fa` : dL === 0 ? "Scade oggi" : `${dL} giorni lavorativi alla scadenza`}
             </div>
           )}
@@ -2727,44 +2846,41 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
             <span style={{ fontSize:13, color:C.l2 }}>Avanzamento</span>
             <span style={{ fontSize:13, fontWeight:700, color:task.color }}>{task.progress}%</span>
           </div>
-          <div style={{ background:C.s3, borderRadius:5, height:10, overflow:"hidden" }}>
-            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:5, transition:"width 0.3s" }} />
+          <div style={{ background:C.s3, borderRadius:6, height:10, overflow:"hidden" }}>
+            <div style={{ height:"100%", width:`${task.progress}%`, background:task.color, borderRadius:6, transition:"width 0.3s" }} />
           </div>
-          <div style={{ fontSize:12, color:C.l3, textAlign:"center", marginTop:5 }}>{doneSubs} di {task.subtasks.length} completati</div>
+          <div style={{ fontSize:12, color:C.l3, textAlign:"center", marginTop:4}}>{doneSubs} di {task.subtasks.length} completati</div>
         </div>
         )}
 
         {/* Subtasks */}
         {task.subtasks.length > 0 && (
-          <div style={{ width:"100%", background:C.s1, borderRadius:16, overflow:"hidden", boxShadow:C.shadow }}>
+          <div style={{ width:"100%", background:C.s1, borderRadius:14, overflow:"hidden", boxShadow:C.shadow }}>
             {task.subtasks.map((s, idx) => (
-              <div key={s.id} onClick={() => onToggleSub(task.id, s.id)}
-                style={{ display:"flex", alignItems:"center", gap:12, padding:"12px 16px", borderBottom: idx < task.subtasks.length-1 ? `1px solid ${C.sep}` : "none", cursor:"pointer", transition:"background 0.1s" }}
-                onMouseEnter={e => { e.currentTarget.style.background = C.s2; }}
-                onMouseLeave={e => { e.currentTarget.style.background = ""; }}>
-                <div style={{ width:17, height:17, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.2s" }}>
+              <HoverDiv key={s.id} onClick={() => onToggleSub(task.id, s.id)}
+                style={{ display:"flex", alignItems:"center", gap:12, padding:"12px 16px", borderBottom: idx < task.subtasks.length-1 ? `1px solid ${C.sep}` : "none", cursor:"pointer", transition:"background 0.15s" }}
+                hoverStyle={{ background:C.s2 }}>
+                <div style={{ width:17, height:17, borderRadius:"50%", flexShrink:0, background:s.done ? task.color : "transparent", border:`1.5px solid ${s.done ? task.color : C.s3}`, display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.15s" }}>
                   {s.done && <svg width="9" height="8" viewBox="0 0 10 8" fill="none"><path d="M1 4L3.5 6.5L9 1" stroke="white" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round"/></svg>}
                 </div>
                 <span style={{ fontSize:14, color: s.done ? C.l3 : C.l1, textDecoration: s.done ? "line-through" : "none", flex:1 }}>{s.label}</span>
-              </div>
+              </HoverDiv>
             ))}
           </div>
         )}
 
         {/* Actions */}
-        <div style={{ display:"flex", gap:10, width:"100%" }}>
-          <button onClick={() => onComplete(task.id)}
-            style={{ flex:1, padding:"14px", borderRadius:14, border:"none", background:`${C.green}20`, color:C.green, cursor:"pointer", fontSize:15, fontWeight:700, fontFamily:"inherit", transition:"all 0.2s" }}
-            onMouseEnter={e => e.currentTarget.style.background = `${C.green}35`}
-            onMouseLeave={e => e.currentTarget.style.background = `${C.green}20`}>
+        <div style={{ display:"flex", gap:12, width:"100%" }}>
+          <HoverBtn onClick={() => onComplete(task.id)}
+            style={{ flex:1, padding:"14px", borderRadius:14, border:"none", background:`${C.green}20`, color:C.green, cursor:"pointer", fontSize:15, fontWeight:700, fontFamily:"inherit", transition:"all 0.15s" }}
+            hoverStyle={{ background:`${C.green}35` }}>
             ✓ Fatto
-          </button>
-          <button onClick={() => onPostpone(task.id)}
-            style={{ padding:"14px 20px", borderRadius:14, border:`1px solid ${C.sep}`, background:"none", color:C.l3, cursor:"pointer", fontSize:14, fontWeight:500, fontFamily:"inherit", transition:"all 0.2s", whiteSpace:"nowrap" }}
-            onMouseEnter={e => { e.currentTarget.style.color = C.l1; e.currentTarget.style.borderColor = C.l2; }}
-            onMouseLeave={e => { e.currentTarget.style.color = C.l3; e.currentTarget.style.borderColor = C.sep; }}>
+          </HoverBtn>
+          <HoverBtn onClick={() => onPostpone(task.id)}
+            style={{ padding:"14px 20px", borderRadius:14, border:`1px solid ${C.sep}`, background:"none", color:C.l3, cursor:"pointer", fontSize:14, fontWeight:500, fontFamily:"inherit", transition:"all 0.15s", whiteSpace:"nowrap" }}
+            hoverStyle={{ color:C.l1, borderColor:C.l2 }}>
             → Domani
-          </button>
+          </HoverBtn>
         </div>
 
       </div>
@@ -2772,42 +2888,90 @@ function FocusMode({ task, onExit, onComplete, onUncomplete, onToggleSub, onUpda
   );
 }
 
+// ── Overflow menu ──
+function OverflowMenu({ anchorRef, onClose, children }) {
+  const C = useContext(ThemeCtx);
+  const menuRef = useRef(null);
+
+  useEffect(() => {
+    function onKey(e) { if (e.key === "Escape") onClose(); }
+    function onOutside(e) {
+      if (menuRef.current && !menuRef.current.contains(e.target) &&
+          anchorRef.current && !anchorRef.current.contains(e.target)) onClose();
+    }
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("mousedown", onOutside);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+      document.removeEventListener("mousedown", onOutside);
+    };
+  }, []);
+
+  const rect = anchorRef.current ? anchorRef.current.getBoundingClientRect() : null;
+  const style = rect ? {
+    position: "fixed",
+    top: rect.bottom + 8,
+    right: Math.max(8, window.innerWidth - rect.right),
+    zIndex: 2000,
+  } : { position: "fixed", top: 60, right: 24, zIndex: 2000 };
+
+  return ReactDOM.createPortal(
+    <div ref={menuRef} onClick={e => e.stopPropagation()}
+      style={{ ...style, background: C.s1, border: `1px solid ${C.sep}`, borderRadius: 14,
+        padding: "6px 0", minWidth: 230,
+        boxShadow: "0 12px 48px rgba(0,0,0,0.28), 0 2px 8px rgba(0,0,0,0.12)",
+        animation: "menuIn 0.15s ease" }}>
+      <style>{`@keyframes menuIn{from{opacity:0;transform:translateY(-6px) scale(0.97)}to{opacity:1;transform:translateY(0) scale(1)}}`}</style>
+      {children}
+    </div>,
+    document.body
+  );
+}
+
+function OverflowItem({ icon, label, badge, onClick, destructive, active, children }) {
+  const C = useContext(ThemeCtx);
+  const [hover, setHover] = useState(false);
+  const color = destructive ? C.red : active ? C.blue : C.l1;
+  return (
+    <div onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      style={{ display: "flex", alignItems: "center", gap: 11, padding: "9px 16px",
+        cursor: onClick ? "pointer" : "default",
+        background: hover && onClick ? C.s2 : "transparent",
+        transition: "background 0.15s", userSelect: "none" }}>
+      {icon && <span style={{ width: 18, display: "flex", alignItems: "center", justifyContent: "center", color, flexShrink: 0 }}>{icon}</span>}
+      <span style={{ flex: 1, fontSize: 13, fontWeight: 500, color }}>{label}</span>
+      {badge != null && badge > 0 && (
+        <span style={{ fontSize: 11, fontWeight: 700, color: C.red, background: `${C.red}18`, borderRadius: 10, padding: "1px 7px" }}>{badge}</span>
+      )}
+      {active && !badge && <span style={{ fontSize: 12, color: C.blue }}>✓</span>}
+      {children}
+    </div>
+  );
+}
+
+function OverflowSep() {
+  const C = useContext(ThemeCtx);
+  return <div style={{ height: 1, background: C.sep, margin: "5px 0" }} />;
+}
+
 function App() {
   // ── Persistence: load from localStorage on first render ──
   const [tasks, setTasks] = useState(() => {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (raw) return JSON.parse(raw).map(normalizeTask);
-    } catch(e) {}
-    return [];
+    try { return (lsRead(LS_KEY, null, true) || []).map(normalizeTask); } catch { return []; }
   });
 
   const [trash, setTrash] = useState(() => {
-    try {
-      const raw = localStorage.getItem(LS_TRASH);
-      if (raw) return JSON.parse(raw).map(normalizeTask);
-    } catch(e) {}
-    return [];
+    try { return (lsRead(LS_TRASH, null, true) || []).map(normalizeTask); } catch { return []; }
   });
 
-  const [attTrash, setAttTrash] = useState(() => {
-    try {
-      const raw = localStorage.getItem(LS_ATT_TRASH);
-      if (raw) return JSON.parse(raw);
-    } catch(e) {}
-    return [];
-  });
+  const [attTrash, setAttTrash] = useState(() => lsRead(LS_ATT_TRASH, [], true));
 
-  const [isDark, setIsDark] = useState(() => {
-    try { return localStorage.getItem(LS_THEME) !== "light"; } catch(e) { return true; }
-  });
+  const [isDark, setIsDark] = useState(() => lsRead(LS_THEME, null) !== "light");
 
-  const [templates, setTemplates] = useState(() => {
-    try { const r = localStorage.getItem(LS_TEMPLATES); return r ? JSON.parse(r) : []; } catch(e) { return []; }
-  });
-  useEffect(() => {
-    try { localStorage.setItem(LS_TEMPLATES, JSON.stringify(templates)); } catch(e) {}
-  }, [templates]);
+  const [templates, setTemplates] = useState(() => lsRead(LS_TEMPLATES, [], true));
+  useEffect(() => { lsWrite(LS_TEMPLATES, templates, true); }, [templates]);
 
   const saveTemplate     = useCallback(tpl => setTemplates(ts => [...ts, tpl]), []);
   const saveAllTemplates = useCallback(list => setTemplates(list), []);
@@ -2817,32 +2981,24 @@ function App() {
   const [storageUsage, setStorageUsage] = useState(() => getStorageUsage());
   const [completionToast, setCompletionToast] = useState(null);
   const dayProgress = useDayProgress();
-  const [busyHours, setBusyHours] = useState(function() {
-    try {
-      var raw = localStorage.getItem(LS_BUSY + "_" + today);
-      return raw !== null ? parseFloat(raw) : 0;
-    } catch(e) { return 0; }
+  const [busyHours, setBusyHours] = useState(() => {
+    const raw = lsRead(LS_BUSY + "_" + today, null);
+    return raw !== null ? parseFloat(raw) : 0;
   });
-  useEffect(function() {
-    try { localStorage.setItem(LS_BUSY + "_" + today, String(busyHours)); } catch(e) {}
-  }, [busyHours]);
+  useEffect(() => { lsWrite(LS_BUSY + "_" + today, busyHours); }, [busyHours]);
 
   // ── Persistence: save to localStorage on every change ──
   useEffect(() => {
-    try { localStorage.setItem(LS_KEY, JSON.stringify(tasks)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
+    lsWrite(LS_KEY, tasks, true); setSavedAt(Date.now()); setStorageUsage(getStorageUsage());
   }, [tasks]);
 
   useEffect(() => {
-    try { localStorage.setItem(LS_TRASH, JSON.stringify(trash)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
+    lsWrite(LS_TRASH, trash, true); setSavedAt(Date.now()); setStorageUsage(getStorageUsage());
   }, [trash]);
 
-  useEffect(() => {
-    try { localStorage.setItem(LS_ATT_TRASH, JSON.stringify(attTrash)); setSavedAt(Date.now()); setStorageUsage(getStorageUsage()); } catch(e) {}
-  }, [attTrash]);
+  useEffect(() => { lsWrite(LS_ATT_TRASH, attTrash, true); }, [attTrash]);
 
-  useEffect(() => {
-    try { localStorage.setItem(LS_THEME, isDark ? "dark" : "light"); } catch(e) {}
-  }, [isDark]);
+  useEffect(() => { lsWrite(LS_THEME, isDark ? "dark" : "light"); }, [isDark]);
 
   const [sel, setSel]           = useState(null);
   const [showForm, setShowForm] = useState(false);
@@ -2853,7 +3009,9 @@ function App() {
   const [viewMode, setViewMode]     = useState("agenda");
   const [query, setQuery]           = useState("");
   const [focusTaskId, setFocusTaskId] = useState(null);
-  const [showTemplates, setShowTemplates] = useState(false); // null | "picking" | task id
+  const [showTemplates, setShowTemplates] = useState(false);
+  const [showOverflow, setShowOverflow]   = useState(false);
+  const overflowRef = useRef(null);
   const searchRef = useRef(null);
   const importRef = useRef(null);
 
@@ -2943,7 +3101,7 @@ function App() {
     const date = new Date().toISOString().slice(0,10);
     a.href = url; a.download = `time-manager-${date}.json`;
     a.click(); URL.revokeObjectURL(url);
-    try { localStorage.setItem(LS_LAST_EXPORT, String(Date.now())); } catch {}
+    lsWrite(LS_LAST_EXPORT, String(Date.now()));
   }
 
   function importJSON(e) {
@@ -3200,10 +3358,13 @@ function App() {
 
   return (
     <ThemeCtx.Provider value={C}>
-    <div style={{ fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',sans-serif", background:C.bg, minHeight:"100vh", color:C.l1, transition:"background 0.3s, color 0.3s" }}>
+    <div style={{ background:C.bg, minHeight:"100vh", color:C.l1, transition:"background 0.25s ease-out, color 0.25s ease-out" }}>
       <style>{`
         @keyframes panelIn{from{opacity:0;transform:translateX(10px)}to{opacity:1;transform:translateX(0)}}
+        @keyframes advancedIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:translateY(0)}}
         *{box-sizing:border-box}
+        body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','Helvetica Neue',sans-serif;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale}
+        button{font-family:inherit}
         ::-webkit-scrollbar{width:3px}
         ::-webkit-scrollbar-track{background:transparent}
         ::-webkit-scrollbar-thumb{background:${C.s3};border-radius:3px}
@@ -3211,154 +3372,167 @@ function App() {
         input[type=range]{-webkit-appearance:none;appearance:none;height:4px;border-radius:2px;background:${C.s3};outline:none}
         input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:16px;height:16px;border-radius:50%;cursor:pointer;margin-top:-6px}
         .agenda-row:hover{background:${C.s2}!important}
-        .agenda-row:hover .pin-btn{opacity:0.35!important}
+        .agenda-row:hover .pin-btn{opacity:0.6!important}
         .agenda-row:hover .pin-btn:hover{opacity:1!important}
       `}</style>
 
       {/* Header */}
-      <div style={{ background:C.header, backdropFilter:"blur(20px)", borderBottom:`1px solid ${C.sep}`, padding:"14px 24px", position:"sticky", top:0, zIndex:10 }}>
-        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between" }}>
-          <div style={{ display:"flex", alignItems:"baseline", gap:14 }}>
-            <h1 style={{ margin:0, fontSize:20, fontWeight:700, letterSpacing:-0.5, color:C.l1 }}>Attività</h1>
-            <div style={{ display:"flex", gap:10 }}>
-              {groups.today.length > 0 && <span style={{ fontSize:13, color:C.red }}>{groups.today.length} oggi</span>}
-              {groups.inbox.length > 0 && <span style={{ fontSize:13, color:C.yellow }}>{groups.inbox.length} inbox</span>}
-              {groups.load > 0 && <span style={{ fontSize:13, color:groups.load > freeHours ? C.red : C.l3 }}>~{groups.load < 1 ? "<1" : Math.round(groups.load)}h/{freeHours}h libere</span>}
-            </div>
-            <SavedIndicator savedAt={savedAt} />
+      <div style={{ background:C.header, backdropFilter:"blur(20px)", borderBottom:`1px solid ${C.sep}`, padding:"0 24px", position:"sticky", top:0, zIndex:10, height:57, display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+
+        {/* LEFT — title + live badges */}
+        <div style={{ display:"flex", alignItems:"center", gap:12, minWidth:0 }}>
+          <h1 style={{ margin:0, fontSize:17, fontWeight:700, letterSpacing:-0.5, color:C.l1, flexShrink:0 }}>Attività</h1>
+          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+            {groups.today.length > 0 && (
+              <span style={{ fontSize:11, fontWeight:700, color:C.red, background:`${C.red}18`, borderRadius:20, padding:"2px 8px", letterSpacing:0.1 }}>
+                {groups.today.length} oggi
+              </span>
+            )}
+            {groups.inbox.length > 0 && (
+              <span style={{ fontSize:11, fontWeight:700, color:C.yellow, background:`${C.yellow}18`, borderRadius:20, padding:"2px 8px" }}>
+                {groups.inbox.length} inbox
+              </span>
+            )}
+            {groups.load > 0 && (
+              <span style={{ fontSize:11, color: groups.load > freeHours ? C.red : C.l3, fontWeight: groups.load > freeHours ? 600 : 400 }}>
+                ~{groups.load < 1 ? "<1" : Math.round(groups.load)}h / {freeHours}h libere
+              </span>
+            )}
           </div>
-          <div style={{ display:"flex", gap:6, alignItems:"center" }}>
-            {/* Import (hidden input) */}
-            <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={importJSON} />
+          <SavedIndicator savedAt={savedAt} />
+        </div>
 
-            {/* Busy hours input */}
-            <div title="Ore già occupate oggi (riunioni, impegni fissi)" style={{ display:"flex", alignItems:"center", gap:5, background:C.s2, borderRadius:10, padding:"0 10px", height:34, border:`1px solid ${busyHours > 0 ? `${C.orange}60` : "transparent"}`, transition:"border-color 0.2s" }}>
-              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke={busyHours > 0 ? C.orange : C.l3} strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ flexShrink:0 }}>
-                <rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>
+        {/* RIGHT — primary actions */}
+        <div style={{ display:"flex", gap:8, alignItems:"center", flexShrink:0 }}>
+          {/* Hidden import input */}
+          <input ref={importRef} type="file" accept=".json" style={{ display:"none" }} onChange={importJSON} />
+
+          {/* Search */}
+          <div style={{ display:"flex", alignItems:"center", background:C.s2, borderRadius:10, border:`1px solid ${query ? `${C.blue}60` : "transparent"}`, transition:"all 0.15s", overflow:"hidden" }}>
+            <div style={{ display:"flex", alignItems:"center", paddingLeft:10, color:C.l3, flexShrink:0 }}>
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
               </svg>
-              <input
-                type="number" min="0" max="8" step="0.5"
-                value={busyHours || ""}
-                onChange={function(e) {
-                  var v = parseFloat(e.target.value);
-                  setBusyHours(isNaN(v) ? 0 : Math.min(8, Math.max(0, v)));
-                }}
-                placeholder="0"
-                title="Ore già occupate oggi"
-                style={{ width:32, background:"none", border:"none", outline:"none", fontSize:13, color:busyHours > 0 ? C.orange : C.l2, fontFamily:"inherit", textAlign:"center", padding:0 }}
-              />
-              <span style={{ fontSize:11, color:C.l3, whiteSpace:"nowrap" }}>h occupate</span>
             </div>
+            <input ref={searchRef} value={query}
+              onChange={e => { setQuery(e.target.value); setSel(null); }}
+              onKeyDown={e => { if (e.key === "Escape") { setQuery(""); searchRef.current.blur(); } }}
+              placeholder="Cerca…"
+              style={{ background:"none", border:"none", outline:"none", fontSize:13, color:C.l1, padding:"7px 10px 7px 7px", width: query ? 180 : 90, transition:"width 0.25s", fontFamily:"inherit" }} />
+            {query && (
+              <button onClick={() => { setQuery(""); searchRef.current.focus(); }}
+                style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", padding:"0 8px 0 0", fontSize:14, lineHeight:1, display:"flex", alignItems:"center" }}>✕</button>
+            )}
+          </div>
 
-            {/* Templates */}
-            <button onClick={() => setShowTemplates(true)} title="Modelli di sottotask"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>
-              </svg>
-            </button>
+          {/* View tabs */}
+          <div style={{ display:"flex", background:C.s2, borderRadius:10, padding:3, gap:2 }}>
+            {[["agenda","Agenda"],["gantt","Gantt"]].map(([v, label]) => (
+              <button key={v} onClick={() => setViewMode(v)}
+                style={{ background: viewMode === v ? C.s1 : "transparent", border:"none", borderRadius:6, padding:"5px 14px", cursor:"pointer", fontSize:12, fontWeight:600, color: viewMode === v ? C.l1 : C.l3, fontFamily:"inherit", transition:"all 0.15s", boxShadow: viewMode === v ? "0 1px 4px rgba(0,0,0,0.15)" : "none" }}>
+                {label}
+              </button>
+            ))}
+          </div>
 
-            {/* Trash button */}
-            <button onClick={() => setShowTrash(true)} title="Cestino"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:(trash.length + attTrash.length) > 0 ? C.red : C.l3, flexShrink:0, position:"relative" }}>
-              <svg width="14" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
-              </svg>
-              {(trash.length + attTrash.length) > 0 && (
-                <span style={{ position:"absolute", top:2, right:2, width:8, height:8, borderRadius:"50%", background:C.red, border:`1.5px solid ${C.bg}` }} />
-              )}
-            </button>
+          {/* Focus */}
+          <button onClick={() => setFocusTaskId("picking")} title="Modalità focus (F)"
+            style={{ background: focusTaskId && focusTaskId !== "picking" ? `${C.blue}22` : "none", border:`1px solid ${focusTaskId && focusTaskId !== "picking" ? C.blue : C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.15s", color: focusTaskId && focusTaskId !== "picking" ? C.blue : C.l2, flexShrink:0 }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>
+            </svg>
+          </button>
 
-            {/* Import button */}
-            <button onClick={() => importRef.current.click()} title="Importa backup JSON"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
-              </svg>
-            </button>
+          {/* Review */}
+          <button onClick={() => setShowReview(true)} title="Chiusura giornata"
+            style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.15s", color:C.l2, flexShrink:0 }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
+            </svg>
+          </button>
 
-            {/* Export button */}
-            <button onClick={exportJSON} title="Esporta backup JSON"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", color:C.l3, flexShrink:0 }}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
-              </svg>
-            </button>
+          {/* Overflow menu ··· */}
+          <button ref={overflowRef} onClick={() => setShowOverflow(o => !o)}
+            title="Altro"
+            style={{ background: showOverflow ? C.s3 : "none", border:`1px solid ${showOverflow ? C.sep : C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.15s", color:C.l2, flexShrink:0, fontSize:15, letterSpacing:1, fontWeight:700, paddingBottom:3 }}>
+            ···
+          </button>
 
-            {/* Search */}
-            <div style={{ position:"relative", display:"flex", alignItems:"center" }}>
-              <div style={{ display:"flex", alignItems:"center", background:C.s2, borderRadius:10, border:`1px solid ${query ? `${C.blue}60` : "transparent"}`, transition:"all 0.2s", overflow:"hidden" }}>
-                <div style={{ display:"flex", alignItems:"center", paddingLeft:10, color:C.l3, flexShrink:0 }}>
-                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
-                  </svg>
+          {/* + Nuovo */}
+          <HoverBtn onClick={() => setShowForm(true)}
+            style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"8px 18px", fontWeight:600, fontSize:14, cursor:"pointer", letterSpacing:-0.2, flexShrink:0, transition:"opacity 0.15s" }}
+            hoverStyle={{ opacity:0.85 }}>
+            + Nuovo
+          </HoverBtn>
+
+          {/* Overflow dropdown */}
+          {showOverflow && (
+            <OverflowMenu anchorRef={overflowRef} onClose={() => setShowOverflow(false)}>
+
+              {/* Ore occupate */}
+              <OverflowItem
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>}
+                label="Ore già occupate oggi"
+                active={busyHours > 0}>
+                <div style={{ display:"flex", alignItems:"center", gap:4 }}>
+                  <input type="number" min="0" max="8" step="0.5"
+                    value={busyHours || ""}
+                    onChange={e => { const v = parseFloat(e.target.value); setBusyHours(isNaN(v) ? 0 : Math.min(8, Math.max(0, v))); }}
+                    onClick={e => e.stopPropagation()}
+                    placeholder="0"
+                    style={{ width:36, background:C.s3, border:"none", borderRadius:6, padding:"3px 6px", fontSize:13, color:busyHours > 0 ? C.orange : C.l1, fontFamily:"inherit", textAlign:"center", outline:"none" }} />
+                  <span style={{ fontSize:11, color:C.l3 }}>h</span>
                 </div>
-                <input
-                  ref={searchRef}
-                  value={query}
-                  onChange={e => { setQuery(e.target.value); setSel(null); }}
-                  onKeyDown={e => { if (e.key === "Escape") { setQuery(""); searchRef.current.blur(); } }}
-                  placeholder="Cerca…"
-                  style={{ background:"none", border:"none", outline:"none", fontSize:13, color:C.l1, padding:"7px 10px 7px 7px", width: query ? 180 : 90, transition:"width 0.25s", fontFamily:"inherit" }}
-                />
-                {query && (
-                  <button onClick={() => { setQuery(""); searchRef.current.focus(); }}
-                    style={{ background:"none", border:"none", color:C.l3, cursor:"pointer", padding:"0 8px 0 0", fontSize:14, lineHeight:1, display:"flex", alignItems:"center" }}>✕</button>
-                )}
-              </div>
-            </div>
+              </OverflowItem>
 
-            {/* View tabs */}
-            <div style={{ display:"flex", background:C.s2, borderRadius:10, padding:3, gap:2 }}>
-              {[["agenda","Agenda"],["gantt","Gantt"]].map(function(pair) {
-                var v = pair[0]; var label = pair[1];
-                return (
-                  <button key={v} onClick={() => setViewMode(v)}
-                    style={{ background: viewMode === v ? C.s1 : "transparent", border:"none", borderRadius:7, padding:"5px 14px", cursor:"pointer", fontSize:12, fontWeight:600, color: viewMode === v ? C.l1 : C.l3, fontFamily:"inherit", transition:"all 0.15s", boxShadow: viewMode === v ? "0 1px 4px rgba(0,0,0,0.15)" : "none" }}>
-                    {label}
-                  </button>
-                );
-              })}
-            </div>
+              <OverflowSep />
 
-            {/* Theme toggle */}
-            <button onClick={() => setIsDark(d => !d)} title={isDark ? "Passa a light mode" : "Passa a dark mode"}
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l2, flexShrink:0 }}>
-              {isDark ? (
-                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
-                </svg>
-              ) : (
-                <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
-                </svg>
-              )}
-            </button>
+              {/* Modelli */}
+              <OverflowItem
+                onClick={() => { setShowTemplates(true); setShowOverflow(false); }}
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>}
+                label="Modelli di sottotask" />
 
-            {/* Help */}
-            <button onClick={() => setShowHelp(true)} title="Scorciatoie da tastiera (?)"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l3, flexShrink:0, fontSize:14, fontWeight:600, fontFamily:"inherit" }}>
-              ?
-            </button>
+              {/* Cestino */}
+              <OverflowItem
+                onClick={() => { setShowTrash(true); setShowOverflow(false); }}
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>}
+                label="Cestino"
+                badge={trash.length + attTrash.length}
+                destructive={(trash.length + attTrash.length) > 0} />
 
-            {/* Review */}
-            <button onClick={() => setShowReview(true)} title="Chiusura giornata"
-              style={{ background:"none", border:`1px solid ${C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color:C.l2, flexShrink:0 }}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
-              </svg>
-            </button>
+              <OverflowSep />
 
-            {/* Focus */}
-            <button onClick={() => setFocusTaskId("picking")} title="Modalità focus"
-              style={{ background: focusTaskId && focusTaskId !== "picking" ? `${C.blue}22` : "none", border:`1px solid ${focusTaskId && focusTaskId !== "picking" ? C.blue : C.sep}`, borderRadius:10, width:34, height:34, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", transition:"all 0.25s", color: focusTaskId && focusTaskId !== "picking" ? C.blue : C.l2, flexShrink:0 }}>
-              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/>
-              </svg>
-            </button>
+              {/* Export */}
+              <OverflowItem
+                onClick={() => { exportJSON(); setShowOverflow(false); }}
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>}
+                label="Esporta backup JSON" />
 
-            <button onClick={() => setShowForm(true)} style={{ background:C.blue, border:"none", color:"#fff", borderRadius:10, padding:"8px 18px", fontWeight:600, fontSize:14, cursor:"pointer", letterSpacing:-0.2 }}>+ Nuovo</button>
-          </div>
+              {/* Import */}
+              <OverflowItem
+                onClick={() => { importRef.current.click(); setShowOverflow(false); }}
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>}
+                label="Importa backup JSON" />
+
+              <OverflowSep />
+
+              {/* Theme */}
+              <OverflowItem
+                onClick={() => { setIsDark(d => !d); setShowOverflow(false); }}
+                icon={isDark
+                  ? <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/></svg>
+                  : <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>}
+                label={isDark ? "Passa a light mode" : "Passa a dark mode"} />
+
+              {/* Help */}
+              <OverflowItem
+                onClick={() => { setShowHelp(true); setShowOverflow(false); }}
+                icon={<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>}
+                label="Scorciatoie da tastiera" />
+
+            </OverflowMenu>
+          )}
         </div>
       </div>
 
@@ -3367,7 +3541,7 @@ function App() {
           /* ── Search results ── */
           <div onClick={() => setSel(null)} style={{ flex:1, overflowY:"auto", padding:"20px 24px" }}>
             <div onClick={e => e.stopPropagation()}>
-              <div style={{ display:"flex", alignItems:"baseline", gap:10, marginBottom:16 }}>
+              <div style={{ display:"flex", alignItems:"baseline", gap:12, marginBottom:16 }}>
                 <span style={{ fontSize:13, fontWeight:700, color:C.l1 }}>
                   {searchResults.length === 0 ? "Nessun risultato" : `${searchResults.length} risultat${searchResults.length === 1 ? "o" : "i"}`}
                 </span>
@@ -3382,10 +3556,9 @@ function App() {
                     const hzC = hzColor(hz, C);
                     return (
                       <div key={task.id} style={{ borderBottom: idx < searchResults.length-1 ? `1px solid ${C.sep}` : "none" }}>
-                        <div style={{ display:"flex", alignItems:"stretch", cursor:"pointer", transition:"background 0.1s" }}
-                          onClick={() => setSel(sel === task.id ? null : task.id)}
-                          onMouseEnter={e => e.currentTarget.style.background = C.s2}
-                          onMouseLeave={e => e.currentTarget.style.background = ""}>
+                        <HoverDiv style={{ display:"flex", alignItems:"stretch", cursor:"pointer", transition:"background 0.15s" }}
+                          hoverStyle={{ background:C.s2 }}
+                          onClick={() => setSel(sel === task.id ? null : task.id)}>
                           {/* Hz color bar */}
                           <div style={{ width:4, background: task.type === "inbox" ? C.l3 : hzC, flexShrink:0, borderRadius:"4px 0 0 4px" }} />
                           <div style={{ flex:1, padding:"11px 14px" }}>
@@ -3405,14 +3578,14 @@ function App() {
                             {matchSubs.length > 0 && (
                               <div style={{ display:"flex", flexWrap:"wrap", gap:4, paddingLeft:15, marginTop:4 }}>
                                 {matchSubs.map(s => (
-                                  <span key={s.id} style={{ fontSize:10, color:C.l3, background:C.s3, borderRadius:5, padding:"2px 7px" }}>
+                                  <span key={s.id} style={{ fontSize:11, color:C.l3, background:C.s3, borderRadius:6, padding:"2px 7px" }}>
                                     {s.done ? "✓ " : ""}{s.label}
                                   </span>
                                 ))}
                               </div>
                             )}
                           </div>
-                        </div>
+                        </HoverDiv>
                       </div>
                     );
                   })}
@@ -3436,9 +3609,10 @@ function App() {
           )}
           <AgendaSection items={groups.today} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask}
             label="Oggi" color={C.red} onTogglePin={togglePin} dayPct={dayProgress} onSnooze={snoozeTask}
+            subtitle={getSectionSubtitle("today")}
             extra={groups.load > freeHours ? { text:`~${Math.round(groups.load)}h · overcommitment`, color:C.red } : groups.load > 0 ? { text:`~${groups.load < 1 ? "<1" : Math.round(groups.load)}h stimato`, color:C.l3 } : null} />
-          <AgendaSection items={groups.week} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Questa settimana" color={C.orange} onTogglePin={togglePin} />
-          <AgendaSection items={groups.month} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Prossime settimane" color={C.blue} onTogglePin={togglePin} />
+          <AgendaSection items={groups.week} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Questa settimana" color={C.orange} onTogglePin={togglePin} subtitle={getSectionSubtitle("week")} />
+          <AgendaSection items={groups.month} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Prossime settimane" color={C.blue} onTogglePin={togglePin} subtitle={getSectionSubtitle("month")} />
           <AgendaSection items={groups.backlog} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="Backlog" color={C.l3} onTogglePin={togglePin} />
           {groups.waiting.length > 0 && (
             <AgendaSection items={groups.waiting} selected={sel} onSelect={id => setSel(sel===id?null:id)} onComplete={completeTask} label="In attesa" color={C.teal} onTogglePin={togglePin} />
@@ -3451,7 +3625,7 @@ function App() {
           {!groups.inbox.length && !groups.today.length && !groups.week.length && !groups.month.length && !groups.backlog.length && !groups.waiting.length && (
             <div style={{ textAlign:"center", padding:"60px 24px 80px", color:C.l3, userSelect:"none" }}>
               <div style={{ fontSize:36, marginBottom:16, opacity:0.4 }}>✦</div>
-              <div style={{ fontSize:16, fontWeight:600, color:C.l2, marginBottom:8 }}>Nessun task ancora</div>
+              <div style={{ fontSize:15, fontWeight:600, color:C.l2, marginBottom:8 }}>Nessun task ancora</div>
               <div style={{ fontSize:13, color:C.l3, lineHeight:1.6, maxWidth:280, margin:"0 auto 32px" }}>
                 Cattura un pensiero nella barra qui sopra, oppure crea un task strutturato con <span style={{ color:C.blue, fontWeight:500 }}>+ Nuovo</span> in alto a destra.
               </div>
@@ -3464,7 +3638,7 @@ function App() {
           )}
 
           <div style={{ textAlign:"center", padding:"28px 24px 20px", userSelect:"none" }}>
-            <span style={{ fontFamily:"-apple-system,BlinkMacSystemFont,'SF Pro Text','Helvetica Neue',sans-serif", fontStyle:"normal", fontWeight:300, fontSize:12, color:C.l3, opacity:0.4, letterSpacing:0.4 }}>
+            <span style={{ fontFamily:"inherit", fontStyle:"normal", fontWeight:300, fontSize:12, color:C.l3, opacity:0.4, letterSpacing:0.4 }}>
               Designed by Duccio Ruozzi and Claude in 2026
             </span>
           </div>
