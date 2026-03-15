@@ -99,7 +99,7 @@ L'app è costruita con React 18 (via Babel standalone) e non richiede alcun buil
 - Simboli di orizzonte (● ◕ ◑ ○) come supporto all'accessibilità cromatica
 - Ottimizzazione rendering con `useCallback` su tutti i mutatori
 
-### v1.0 — 2025
+### v1.0 — 2026
 - Prima release pubblica
 
 ---
